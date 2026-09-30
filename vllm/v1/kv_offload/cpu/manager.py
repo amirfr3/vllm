@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 from typing_extensions import override
 
@@ -25,6 +26,10 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
     CPUOffloadingMetrics,
+)
+from vllm.v1.kv_offload.cpu.policies.admission import (
+    StoreAdmissionPolicy,
+    create_store_admission_policy,
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
@@ -63,6 +68,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        store_admission_policy: dict[str, Any] | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -83,6 +89,15 @@ class CPUOffloadingManager(OffloadingManager):
         self.stores_skipped_in_current_batch: int = 0
         self.allocation_sizes_in_current_batch: list[int] = []
         self._cache_generation = 0
+        self._store_admission: StoreAdmissionPolicy = create_store_admission_policy(
+            store_admission_policy
+        )
+        if store_threshold >= 2 and self.store_triggers != {StoreTrigger.ON_COMPUTE}:
+            # A late store is the only offer of a chunk, so a threshold drops it.
+            raise ValueError(
+                "store_threshold >= 2 is not supported with store triggers "
+                f"{sorted(t.name for t in self.store_triggers)}"
+            )
 
         # Number of chunk references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -178,7 +193,40 @@ class CPUOffloadingManager(OffloadingManager):
             key for key in reused_keys if key not in state.inserted_keys
         )
 
+    def _record_store_offer(
+        self,
+        keys: list[OffloadKey],
+        keys_to_store: list[OffloadKey],
+        ready_existing_keys: list[OffloadKey],
+        req_context: ReqContext,
+    ) -> _RequestCacheAccess:
+        state = self._get_request_cache_access(req_context)
+        new_store_misses = [
+            key for key in keys_to_store if key not in state.store_miss_keys
+        ]
+        if new_store_misses:
+            # ARC learns from B1/B2 before insert() removes the ghost entry.
+            # Deduplication makes this one policy observation per request.
+            self._policy.on_store_miss(new_store_misses, req_context)
+            state.store_miss_keys.update(new_store_misses)
+
+        recorded_keys = set(keys_to_store)
+        recorded_keys.update(ready_existing_keys)
+        # Record once before any allocation-related early return. Store
+        # candidates are classified as insertions only after allocation succeeds.
+        self._record_request_cache_access(
+            (key for key in keys if key in recorded_keys),
+            req_context,
+            reused_keys=ready_existing_keys,
+        )
+        return state
+
     # --- OffloadingManager interface ---
+
+    @property
+    @override
+    def store_triggers(self) -> frozenset[StoreTrigger]:
+        return self._store_admission.triggers
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -248,7 +296,8 @@ class CPUOffloadingManager(OffloadingManager):
         req_context: ReqContext | None,
         trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ) -> PrepareStoreOutput | None:
-        assert trigger in self.store_triggers and req_context is not None
+        # The request of an ON_OVERWRITE store is finished.
+        assert (req_context is None) == (trigger == StoreTrigger.ON_OVERWRITE)
         keys = list(keys)
         if self.counts is not None:
             self._record_accesses(keys)
@@ -276,25 +325,18 @@ class CPUOffloadingManager(OffloadingManager):
                 keys_to_store
             )
 
-        state = self._get_request_cache_access(req_context)
-        new_store_misses = [
-            key for key in keys_to_store if key not in state.store_miss_keys
-        ]
-        if new_store_misses:
-            # ARC learns from B1/B2 before insert() removes the ghost entry.
-            # Deduplication makes this one policy observation per request.
-            self._policy.on_store_miss(new_store_misses, req_context)
-            state.store_miss_keys.update(new_store_misses)
+        state: _RequestCacheAccess | None = None
+        if req_context is None:
+            # ON_OVERWRITE: the ON_COMPUTE offer of these keys recorded the access.
+            self._policy.touch(ready_existing_keys, None)
+        else:
+            state = self._record_store_offer(
+                keys, keys_to_store, ready_existing_keys, req_context
+            )
 
-        recorded_keys = set(keys_to_store)
-        recorded_keys.update(ready_existing_keys)
-        # Record once before any allocation-related early return. Store
-        # candidates are classified as insertions only after allocation succeeds.
-        self._record_request_cache_access(
-            (key for key in keys if key in recorded_keys),
-            req_context,
-            reused_keys=ready_existing_keys,
-        )
+        # A refused offer still counts as an access and a store miss.
+        if not self._store_admission.admit(keys, trigger):
+            keys_to_store = []
 
         if not keys_to_store:
             return PrepareStoreOutput(
@@ -346,7 +388,9 @@ class CPUOffloadingManager(OffloadingManager):
         for key, chunk in zip(keys_to_store, chunks):
             self._policy.insert(key, chunk)
         self._num_write_pending_chunks += len(keys_to_store)
-        state.inserted_keys.update(keys_to_store)
+        # The state is None for an ON_OVERWRITE store.
+        if state is not None:
+            state.inserted_keys.update(keys_to_store)
 
         # build store specs for allocated chunks
         store_spec = self._get_load_store_spec(keys_to_store, chunks)

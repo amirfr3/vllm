@@ -68,12 +68,13 @@ class CachePolicy(ABC):
         """Remove a chunk (used to clean up after a failed store)."""
 
     @abstractmethod
-    def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+    def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext | None) -> None:
         """Mark chunks as recently used.
 
         Args:
             keys: Chunks to mark as recently used.
-            req_context: Per-request context for the request touching these chunks.
+            req_context: Per-request context for the request touching these chunks,
+                or None for a store after the request finishes.
 
         """
 

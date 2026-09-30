@@ -15,6 +15,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     PrepareStoreOutput,
     ReqContext,
+    StoreTrigger,
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.common import (
@@ -43,6 +44,7 @@ def make_cpu_manager(
     enable_events: bool = False,
     store_threshold: int = 0,
     max_tracker_size: int = 64_000,
+    store_admission_policy: dict | None = None,
 ) -> CPUOffloadingManager:
     return CPUOffloadingManager(
         num_chunks=num_chunks,
@@ -51,6 +53,7 @@ def make_cpu_manager(
         enable_events=enable_events,
         store_threshold=store_threshold,
         max_tracker_size=max_tracker_size,
+        store_admission_policy=store_admission_policy,
     )
 
 
@@ -1561,3 +1564,46 @@ def test_request_key_positions_order_tails_across_kv_groups():
     output = manager.prepare_store(to_keys([10, 11]), make_req_context("evict"))
     assert output is not None
     assert set(output.evicted_keys) == {group_0_tail, group_1_tail}
+
+
+def test_lazy_policy_stores_on_overwrite_after_request_finished():
+    manager = make_cpu_manager(store_admission_policy={"type": "lazy"})
+    keys = to_keys([1, 2])
+    ctx = make_req_context("lazy")
+
+    output = manager.prepare_store(keys, ctx)
+    assert output is not None
+    assert not output.keys_to_store
+    manager.on_request_finished(ctx)
+
+    output = manager.prepare_store(keys, None, StoreTrigger.ON_OVERWRITE)
+    assert output is not None
+    assert output.keys_to_store == keys
+    manager.complete_store(keys, None, trigger=StoreTrigger.ON_OVERWRITE)
+    assert manager.lookup(keys[0], _EMPTY_REQ_CTX) == LookupResult.HIT
+
+
+def test_lazy_overwrite_of_held_key_refreshes_its_recency():
+    manager = make_cpu_manager(num_chunks=2, store_admission_policy={"type": "lazy"})
+    first, second, third = to_keys([1, 2, 3])
+    for key in (first, second):
+        assert manager.prepare_store([key], None, StoreTrigger.ON_OVERWRITE)
+        manager.complete_store([key], None, trigger=StoreTrigger.ON_OVERWRITE)
+
+    output = manager.prepare_store([first], None, StoreTrigger.ON_OVERWRITE)
+    assert output is not None
+    assert not output.keys_to_store
+
+    output = manager.prepare_store([third], None, StoreTrigger.ON_OVERWRITE)
+    assert output is not None
+    assert output.evicted_keys == [second]
+
+
+def test_late_store_triggers_reject_store_threshold():
+    with pytest.raises(ValueError, match="store_threshold"):
+        make_cpu_manager(store_threshold=2, store_admission_policy={"type": "lazy"})
+
+
+def test_unknown_store_admission_policy_raises():
+    with pytest.raises(ValueError, match="Unknown store admission policy"):
+        make_cpu_manager(store_admission_policy={"type": "unknown"})
