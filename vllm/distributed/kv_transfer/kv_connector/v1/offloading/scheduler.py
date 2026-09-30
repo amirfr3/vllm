@@ -52,6 +52,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
+    StoreTrigger,
     TierFilter,
     TierMatcher,
     make_offload_key,
@@ -81,6 +82,8 @@ class TransferJobStatus:
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
+    # Passed to manager.complete_store() with the same value as prepare_store().
+    trigger: StoreTrigger = StoreTrigger.ON_COMPUTE
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -1897,7 +1900,11 @@ class OffloadingConnectorScheduler:
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                self.manager.complete_store(
+                    job_status.keys,
+                    req_status.req_context,
+                    trigger=job_status.trigger,
+                )
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:

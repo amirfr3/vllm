@@ -42,6 +42,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
+    StoreTrigger,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
@@ -590,7 +591,10 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def prepare_store(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext | None,
+        trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ) -> PrepareStoreOutput | None:
         """Prepare chunks to be stored from GPU to primary tier.
 
@@ -604,6 +608,7 @@ class TieringOffloadingManager(OffloadingManager):
         Args:
             keys: Chunks to prepare for storing.
             req_context: Per-request context.
+            trigger: Why the connector asks for the store.
 
         Returns:
             PrepareStoreOutput describing where to store chunks and what was
@@ -620,13 +625,16 @@ class TieringOffloadingManager(OffloadingManager):
         #    not-yet-ready chunk's ref_cnt from -1 to 0 via complete_write(),
         #    making it evictable for the first time.
         # Both must be accounted for before the eviction decision below.
+        assert trigger in self.store_triggers and req_context is not None
         self._maybe_process_finished_jobs()
 
         # Step 2: Store to primary tier (new chunks only).
         # Cascading of these newly-stored chunks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
-        primary_result = self.primary_tier.prepare_store(keys, req_context)
+        primary_result = self.primary_tier.prepare_store(
+            keys, req_context, trigger=trigger
+        )
 
         if primary_result is None:
             return None
@@ -710,8 +718,9 @@ class TieringOffloadingManager(OffloadingManager):
     def complete_store(
         self,
         keys: Collection[OffloadKey],
-        req_context: ReqContext,
+        req_context: ReqContext | None,
         success: bool = True,
+        trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ) -> None:
         """Mark chunks as done storing from GPU to primary tier.
 
@@ -729,10 +738,12 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Chunks that finished storing.
             success: Whether the GPU→primary transfer succeeded.
             req_context: Per-request context forwarded to primary.prepare_read().
+            trigger: The trigger given to the matching prepare_store().
 
         """
+        assert req_context is not None
         # Step 1: Complete store in primary tier (makes chunks loadable)
-        self.primary_tier.complete_store(keys, req_context, success)
+        self.primary_tier.complete_store(keys, req_context, success, trigger=trigger)
 
         if success:
             # Step 2: Cascade to ALL secondary tiers
