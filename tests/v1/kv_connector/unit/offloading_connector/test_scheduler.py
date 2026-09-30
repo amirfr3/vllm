@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    GpuChunk,
     OffloadingConnectorScheduler,
     RequestOffloadState,
     _create_req_context,
@@ -72,6 +73,7 @@ from vllm.v1.kv_offload.base import (
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
+    StoreTrigger,
     get_offload_block_hash,
     get_offload_group_idx,
     make_offload_key,
@@ -1077,6 +1079,211 @@ def test_request_preemption(request_runner, async_scheduling: bool):
 
     # All stores completed before request_finished -> fence index empty.
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
+
+
+_LAZY_EXTRA_CONFIG = {
+    "store_triggers": ["ON_COMPUTE", "ON_OVERWRITE"],
+    "self_describing_kv_events": False,
+}
+
+
+def _make_lazy_runner(request_runner, async_scheduling: bool, num_gpu_blocks: int):
+    """A runner whose manager refuses ON_COMPUTE and records each offer."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    offers: list[tuple[list, ReqContext | None, StoreTrigger]] = []
+
+    def prepare_store(keys, req_context, trigger=StoreTrigger.ON_COMPUTE):
+        offers.append((list(keys), req_context, trigger))
+        admitted = [] if trigger is StoreTrigger.ON_COMPUTE else keys
+        return generate_store_output(admitted)
+
+    runner.manager.prepare_store.side_effect = prepare_store
+    flushed_job_ids: list[int] = []
+    handler = runner.offloading_spec.handler
+    wait = handler.wait
+
+    def record_wait(job_ids):
+        flushed_job_ids.extend(job_ids)
+        wait(job_ids)
+
+    handler.wait = record_wait
+    return runner, offers, flushed_job_ids
+
+
+def _offered_keys(offers, trigger: StoreTrigger) -> list:
+    return [key for keys, _, t in offers if t is trigger for key in keys]
+
+
+def test_default_store_triggers_keep_no_overwrite_map(request_runner):
+    runner = request_runner(block_size=4, num_gpu_blocks=10, async_scheduling=False)
+    assert runner.connector_scheduler._overwrite_chunks is None
+
+
+@pytest.mark.parametrize(
+    "extra_config",
+    [
+        {"store_triggers": ["ON_OVERWRITE"]},
+        {"store_triggers": ["ON_COMPUTE", "ON_OVERWRITE"]},
+    ],
+)
+def test_unsupported_store_triggers_raise(request_runner, extra_config):
+    """No ON_COMPUTE, or ON_OVERWRITE with self-describing events."""
+    with pytest.raises(ValueError):
+        request_runner(
+            block_size=4,
+            num_gpu_blocks=10,
+            async_scheduling=False,
+            extra_config_overrides=extra_config,
+        )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lazy_death_stores_chunk_without_request_context(
+    request_runner, async_scheduling: bool
+):
+    runner, offers, flushed_job_ids = _make_lazy_runner(
+        request_runner, async_scheduling, num_gpu_blocks=8
+    )
+    runner.new_request(token_ids=list(range(12)))
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    first_keys = set(_offered_keys(offers, StoreTrigger.ON_COMPUTE))
+    assert first_keys
+    assert not _offered_keys(offers, StoreTrigger.ON_OVERWRITE)
+
+    # Fresh blocks for this request include blocks of the first request.
+    # The runner names each GPU block by its new position.
+    offers.clear()
+    runner.new_request(token_ids=list(range(100, 124)))
+    overwritten = (4, 5, 6) if async_scheduling else (4, 5)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=overwritten,
+        expected_flushed=overwritten,
+    )
+
+    dying_keys = _offered_keys(offers, StoreTrigger.ON_OVERWRITE)
+    assert dying_keys
+    assert set(dying_keys) <= first_keys
+    assert all(
+        req_context is None
+        for _, req_context, trigger in offers
+        if trigger is StoreTrigger.ON_OVERWRITE
+    )
+    handler = runner.offloading_spec.handler
+    flushed_keys = {
+        key
+        for job_id in flushed_job_ids
+        for key in handler.transfer_specs[job_id][1].offload_keys
+    }
+    assert set(dying_keys) <= flushed_keys
+    assert not runner.connector_scheduler._jobs
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lazy_prefix_hit_is_not_a_death(request_runner, async_scheduling: bool):
+    runner, offers, _ = _make_lazy_runner(
+        request_runner, async_scheduling, num_gpu_blocks=20
+    )
+    token_ids = list(range(12))
+    runner.new_request(token_ids=token_ids)
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+    offers.clear()
+    runner.new_request(token_ids=token_ids)
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    assert _offered_keys(offers, StoreTrigger.ON_COMPUTE)
+    assert not _offered_keys(offers, StoreTrigger.ON_OVERWRITE)
+
+
+def test_overwrite_store_jobs_isolate_partial_chunks(request_runner):
+    """Full chunks share a job deepest first. A partial chunk gets its own job."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        blocks_per_chunk=4,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
+        generate_store_output(keys)
+    )
+    scheduler = runner.connector_scheduler
+    chunks = [
+        GpuChunk("k1", 0, 1, (10, 11, 12, 13)),
+        GpuChunk("k2", 0, 2, (30, 31)),
+        GpuChunk("k3", 0, 3, (20, 21, 22, 23)),
+    ]
+    for chunk in chunks:
+        for block_id in chunk.block_ids:
+            scheduler._overwrite_chunks.setdefault(block_id, []).append(chunk)
+    # One block of each chunk is enough to overwrite the chunk.
+    scheduler._current_batch_new_block_ids = {10, 20, 30}
+
+    store_jobs = scheduler._build_overwrite_store_jobs()
+
+    assert [
+        (
+            job.src_spec.block_ids.tolist(),
+            job.src_spec.group_sizes,
+            job.src_spec.block_indices,
+            job.dst_spec.offload_keys,
+        )
+        for job in store_jobs.values()
+    ] == [
+        ([20, 21, 22, 23, 10, 11, 12, 13], [8], [12], ["k3", "k1"]),
+        ([30, 31], [2], [10], ["k2"]),
+    ]
+    assert scheduler._current_batch_jobs_to_flush == set(store_jobs)
+    assert scheduler._overwrite_chunks == {}
+    runner.manager.prepare_store.assert_has_calls(
+        [
+            call(["k3", "k1"], None, trigger=StoreTrigger.ON_OVERWRITE),
+            call(["k2"], None, trigger=StoreTrigger.ON_OVERWRITE),
+        ]
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lazy_load_target_is_flushed_before_load(
+    request_runner, async_scheduling: bool
+):
+    """A load into a block of a finished request first stores the old chunk."""
+    # Async scheduling allocates one more block for the first request.
+    runner, offers, _ = _make_lazy_runner(
+        request_runner, async_scheduling, num_gpu_blocks=5 if async_scheduling else 4
+    )
+    runner.new_request(token_ids=list(range(12)))
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    first_keys = set(_offered_keys(offers, StoreTrigger.ON_COMPUTE))
+
+    handler = runner.offloading_spec.handler
+    worker_calls: list[str] = []
+    wait, submit_load = handler.wait, handler.submit_load
+
+    def record_wait(job_ids):
+        worker_calls.append("flush")
+        wait(job_ids)
+
+    def record_submit_load(job_id, src_spec, dst_spec):
+        worker_calls.append("load")
+        return submit_load(job_id, src_spec, dst_spec)
+
+    handler.wait = record_wait
+    handler.submit_load = record_submit_load
+    # All the free blocks belong to the first request.
+    offers.clear()
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 2
+    runner.new_request(token_ids=list(range(100, 112)))
+    runner._run(decoded_tokens=[EOS_TOKEN_ID], complete_transfers=True)
+
+    assert set(_offered_keys(offers, StoreTrigger.ON_OVERWRITE)) == first_keys
+    assert worker_calls.index("flush") < worker_calls.index("load")
+    assert not runner.connector_scheduler._jobs
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
