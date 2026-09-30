@@ -46,9 +46,7 @@ class EagerStoreAdmissionPolicy(StoreAdmissionPolicy):
 class LazyStoreAdmissionPolicy(StoreAdmissionPolicy):
     """Stores a chunk only when HBM is about to lose it."""
 
-    triggers = frozenset(
-        {StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE, StoreTrigger.ON_PREEMPT}
-    )
+    triggers = frozenset({StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE})
 
     @override
     def admit(self, keys: Collection[OffloadKey], trigger: StoreTrigger) -> bool:

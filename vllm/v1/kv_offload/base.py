@@ -133,8 +133,6 @@ class StoreTrigger(Enum):
     # The block pool gives blocks of the chunks to new requests in this step.
     # req_context is None, and the call can come after on_request_finished.
     ON_OVERWRITE = auto()
-    # The scheduler preempted the request in this step.
-    ON_PREEMPT = auto()
 
 
 class OffloadPolicy(Enum):
