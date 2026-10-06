@@ -84,6 +84,63 @@ class TransferJobStatus:
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
+    # Passed to manager.complete_store() with the same value as prepare_store().
+    trigger: StoreTrigger = StoreTrigger.ON_COMPUTE
+
+
+@dataclass(frozen=True, slots=True)
+class GpuChunk:
+    """A group chunk to store when the block pool gives out one of its blocks."""
+
+    key: OffloadKey
+    config_idx: int
+    chunk_idx: int
+    # The GPU block ids of the chunk, without the null blocks.
+    block_ids: tuple[int, ...]
+    # The key of the data in each block of block_ids
+    block_keys: tuple[OffloadKey, ...]
+
+
+class OverwriteMap:
+    """The group chunks on GPU blocks, to store before a block gets new data."""
+
+    def __init__(self) -> None:
+        # block_id -> the group chunks that hold the block
+        self.by_block: dict[int, list[GpuChunk]] = {}
+
+    def add(self, chunks: Iterable[GpuChunk]) -> None:
+        for chunk in chunks:
+            # A prefix hit offers the chunk of an existing entry again.
+            if chunk in self.by_block.get(chunk.block_ids[-1], ()):
+                continue
+            for block_id in chunk.block_ids:
+                self.by_block.setdefault(block_id, []).append(chunk)
+
+    def take_overwritten(
+        self, block_keys: dict[int, OffloadKey | None]
+    ) -> list[GpuChunk]:
+        """Remove the chunks of blocks that get different data.
+
+        Args:
+            block_keys: block_id -> the key of the data that the new owner
+                expects in the block, or None for new data.
+
+        """
+        overwritten: list[GpuChunk] = []
+        for block_id, block_key in block_keys.items():
+            for chunk in tuple(self.by_block.get(block_id, ())):
+                if chunk.block_keys[chunk.block_ids.index(block_id)] == block_key:
+                    continue
+                for chunk_block_id in chunk.block_ids:
+                    chunks = self.by_block[chunk_block_id]
+                    chunks.remove(chunk)
+                    if not chunks:
+                        del self.by_block[chunk_block_id]
+                overwritten.append(chunk)
+        return overwritten
+
+    def clear(self) -> None:
+        self.by_block.clear()
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -91,6 +148,7 @@ class GroupOffloadConfig(NamedTuple):
     tokens_per_block: int
     tokens_per_chunk: int
     hashes_per_chunk: int
+    hashes_per_block: int
     # KV cache spec metadata propagated onto emitted BlockStored events so
     # KV-aware consumers can classify and filter the group.
     kv_event_group_spec: OffloadingEventGroupSpec
@@ -281,6 +339,7 @@ class SchedulerOffloadConfig(NamedTuple):
                         (tokens_per_block * spec.blocks_per_chunk)
                         // spec.tokens_per_hash
                     ),
+                    hashes_per_block=tokens_per_block // spec.tokens_per_hash,
                     sliding_window_size_in_chunks=sw,
                     kv_cache_spec=kv_spec,
                     manager_cls=manager_cls,
@@ -613,8 +672,9 @@ class OffloadingConnectorScheduler:
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
-        # GPU block IDs allocated in the current engine step
-        self._current_batch_allocated_block_ids: set[int] = set()
+        # block_id -> the block key that the owner expects, for the blocks given
+        # out in the current engine step, of all groups
+        self._current_batch_allocated_block_keys: dict[int, OffloadKey | None] = {}
         # if GPU prefix caching is enabled,
         # Track loaded chunks to avoid redundant loads.
         self._chunks_being_loaded: set[OffloadKey] | None = (
@@ -638,11 +698,23 @@ class OffloadingConnectorScheduler:
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
         store_triggers = self.manager.store_triggers
-        if store_triggers != {StoreTrigger.ON_COMPUTE}:
+        if StoreTrigger.ON_COMPUTE not in store_triggers:
             raise ValueError(
-                "The offloading connector supports only ON_COMPUTE stores, got "
+                "The offloading manager must accept ON_COMPUTE stores, got "
                 f"store triggers {sorted(t.name for t in store_triggers)}"
             )
+        self._overwrite_map: OverwriteMap | None = None
+        if StoreTrigger.ON_OVERWRITE in store_triggers:
+            if self._events_tracker.self_describing_enabled:
+                raise ValueError(
+                    "self_describing_kv_events is not supported with "
+                    "ON_OVERWRITE stores"
+                )
+            if self._cow_source_groups:
+                raise ValueError(
+                    "Mamba align groups are not supported with ON_OVERWRITE stores"
+                )
+            self._overwrite_map = OverwriteMap()
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -667,6 +739,59 @@ class OffloadingConnectorScheduler:
             pending.remove(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
+
+    @staticmethod
+    def _block_key(
+        req: Request, group_config: GroupOffloadConfig, block_idx: int
+    ) -> OffloadKey:
+        """The key of the data in one GPU block of a request."""
+        hash_idx = (block_idx + 1) * group_config.hashes_per_block - 1
+        return make_offload_key(req.block_hashes[hash_idx], group_config.group_idx)
+
+    def _add_allocated_blocks(
+        self,
+        req_status: RequestOffloadState,
+        block_id_groups: Sequence[Sequence[int]],
+        start_block_idxs: Sequence[int],
+    ) -> None:
+        """Record the block key that the owner expects in each allocated block.
+
+        A block gets None if its group is not offloaded (the groups share the
+        block pool) or if its hash is not known yet.
+        """
+        block_keys = self._current_batch_allocated_block_keys
+        for block_ids in block_id_groups:
+            block_keys.update((bid, None) for bid in block_ids if bid != 0)
+        req = req_status.req
+        for group_config, start in zip(self.config.kv_group_configs, start_block_idxs):
+            num_hashed_blocks = len(req.block_hashes) // group_config.hashes_per_block
+            for idx, bid in enumerate(block_id_groups[group_config.group_idx], start):
+                if bid != 0 and idx < num_hashed_blocks:
+                    block_keys[bid] = self._block_key(req, group_config, idx)
+
+    def _make_gpu_chunk(
+        self,
+        req: Request,
+        config_idx: int,
+        chunk_idx: int,
+        key: OffloadKey,
+        group_block_ids: Sequence[int],
+    ) -> GpuChunk:
+        """The group chunk on the non-null GPU blocks of a request chunk."""
+        start = chunk_idx * self.config.blocks_per_chunk
+        block_idxs = [
+            idx
+            for idx in range(start, start + self.config.blocks_per_chunk)
+            if group_block_ids[idx]
+        ]
+        group_config = self.config.kv_group_configs[config_idx]
+        return GpuChunk(
+            key,
+            config_idx,
+            chunk_idx,
+            tuple(group_block_ids[idx] for idx in block_idxs),
+            tuple(self._block_key(req, group_config, idx) for idx in block_idxs),
+        )
 
     def _calc_num_offloadable_tokens(
         self, req_status: RequestOffloadState, num_computed_tokens: int
@@ -1154,10 +1279,13 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        req_status = self._req_status[request.request_id]
+        # An async load request is not in the scheduler output of this step.
+        self._add_allocated_blocks(
+            req_status, blocks.get_block_ids(), [0] * len(req_status.group_states)
+        )
         if num_external_tokens == 0:
             return
-
-        req_status = self._req_status[request.request_id]
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_locally_computed_tokens + num_external_tokens
@@ -1176,10 +1304,6 @@ class OffloadingConnectorScheduler:
             req_status.group_states,
         ):
             group_blocks = blocks.blocks[group_config.group_idx]
-            self._current_batch_allocated_block_ids.update(
-                block.block_id for block in group_blocks if block.block_id != 0
-            )
-
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
             offload_keys = group_state.offload_keys
@@ -1307,15 +1431,17 @@ class OffloadingConnectorScheduler:
                         len(req_status.group_states[grp_idx].block_ids)
                         for grp_idx in self._sliding_window_groups
                     )
+                start_block_idxs = [
+                    len(group_state.block_ids)
+                    for group_state in req_status.group_states
+                ]
                 req_status.update_block_id_groups(new_block_id_groups)
-                for group_config in self.config.kv_group_configs:
-                    new_blocks = new_block_id_groups[group_config.group_idx]
-                    for bid in new_blocks:
-                        if bid != 0:
-                            self._current_batch_allocated_block_ids.add(bid)
+                self._add_allocated_blocks(
+                    req_status, new_block_id_groups, start_block_idxs
+                )
 
         for copy in scheduler_output.kv_cache_block_copies or ():
-            self._current_batch_allocated_block_ids.add(copy.dst_block_id)
+            self._current_batch_allocated_block_keys.setdefault(copy.dst_block_id, None)
 
         # Zero out stale block_ids in sliding window groups' pending-store
         # positions. Only sliding window groups can have stale entries (blocks
@@ -1323,7 +1449,7 @@ class OffloadingConnectorScheduler:
         # [next_stored_chunk_idx * bsf, end) need checking where end is the
         # pre-extend length: earlier positions were already offloaded, later
         # ones are fresh allocations from this step.
-        if self._sliding_window_groups and self._current_batch_allocated_block_ids:
+        if self._sliding_window_groups and self._current_batch_allocated_block_keys:
             blocks_per_chunk = self.config.blocks_per_chunk
             for req_id, req_status in self._req_status.items():
                 ends = new_block_ids_end.get(req_id)
@@ -1334,7 +1460,7 @@ class OffloadingConnectorScheduler:
                     for j in range(start, end):
                         if (
                             group_state.block_ids[j]
-                            in self._current_batch_allocated_block_ids
+                            in self._current_batch_allocated_block_keys
                         ):
                             group_state.block_ids[j] = 0
 
@@ -1611,6 +1737,7 @@ class OffloadingConnectorScheduler:
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            offered_chunks: list[GpuChunk] = []
             group_store_ranges: list[tuple[int, int]] = []
 
             reachable_boundaries: tuple[int, ...] = ()
@@ -1619,8 +1746,8 @@ class OffloadingConnectorScheduler:
                 if req.shared_prefix_boundary:
                     reachable_boundaries += (req.shared_prefix_boundary,)
 
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
+            for config_idx, (group_config, group_state) in enumerate(
+                zip(self.config.kv_group_configs, req_status.group_states)
             ):
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
@@ -1732,6 +1859,16 @@ class OffloadingConnectorScheduler:
                     ):
                         continue
                     new_offload_keys.append(offload_key)
+                    if self._overwrite_map is not None:
+                        offered_chunks.append(
+                            self._make_gpu_chunk(
+                                req,
+                                config_idx,
+                                abs_chunk_idx,
+                                offload_key,
+                                group_state.block_ids,
+                            )
+                        )
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -1740,6 +1877,8 @@ class OffloadingConnectorScheduler:
             store_output = self.manager.prepare_store(
                 new_offload_keys, req_status.req_context
             )
+            if self._overwrite_map is not None:
+                self._overwrite_map.add(offered_chunks)
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1846,10 +1985,88 @@ class OffloadingConnectorScheduler:
                 # Register non-sliding-window blocks for flush detection.
                 for bid in deferred_fence_block_ids:
                     self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
-                    if bid in self._current_batch_allocated_block_ids:
+                    if bid in self._current_batch_allocated_block_keys:
                         self._current_batch_jobs_to_flush.add(job_id)
 
         return store_jobs
+
+    def _build_overwrite_store_jobs(self) -> dict[int, TransferJob]:
+        """Store the overwritten group chunks before their blocks get new data."""
+        assert self._overwrite_map is not None
+        # Two block sets can hold the same key, for example after two requests
+        # computed the same prefix in one step. Store one copy of each key.
+        unique_chunks: dict[OffloadKey, GpuChunk] = {}
+        for chunk in self._overwrite_map.take_overwritten(
+            self._current_batch_allocated_block_keys
+        ):
+            other = unique_chunks.get(chunk.key)
+            if other is None or len(chunk.block_ids) > len(other.block_ids):
+                unique_chunks[chunk.key] = chunk
+        # Group-major for the GPU spec. Deepest first, so that the prefix gets
+        # the newest rank.
+        chunks = sorted(
+            unique_chunks.values(), key=lambda c: (c.config_idx, -c.chunk_idx)
+        )
+        # The worker skips null blocks only at the start of each group. So a
+        # chunk with null blocks goes in a job of its own.
+        blocks_per_chunk = self.config.blocks_per_chunk
+        full_chunks = [c for c in chunks if len(c.block_ids) == blocks_per_chunk]
+        batches = [full_chunks] if full_chunks else []
+        batches += [[c] for c in chunks if len(c.block_ids) < blocks_per_chunk]
+
+        store_jobs: dict[int, TransferJob] = {}
+        for batch in batches:
+            store_output = self.manager.prepare_store(
+                [chunk.key for chunk in batch],
+                None,
+                trigger=StoreTrigger.ON_OVERWRITE,
+            )
+            if store_output is None:
+                self._connector_stats.increase_counter(
+                    _ConnectorMetricName.ALLOCATION_FAILURE
+                )
+                logger.warning("Cannot store %d overwritten chunks", len(batch))
+                continue
+            keys_to_store = set(store_output.keys_to_store)
+            if not keys_to_store:
+                continue
+
+            job_id = self._generate_job_id()
+            # An ON_OVERWRITE job belongs to no request.
+            self._jobs[job_id] = TransferJobStatus(
+                req_id="",
+                pending_count=self.config.num_workers,
+                keys=keys_to_store,
+                is_store=True,
+                trigger=StoreTrigger.ON_OVERWRITE,
+            )
+            store_jobs[job_id] = TransferJob(
+                req_id="",
+                src_spec=self._overwrite_src_spec(
+                    [chunk for chunk in batch if chunk.key in keys_to_store]
+                ),
+                dst_spec=store_output.store_spec,
+            )
+        self._current_batch_jobs_to_flush.update(store_jobs)
+        return store_jobs
+
+    def _overwrite_src_spec(self, chunks: list[GpuChunk]) -> GPULoadStoreSpec:
+        """The GPU spec of group-major chunks, deepest first in each group."""
+        num_groups = len(self.config.kv_group_configs)
+        src_block_ids: list[int] = []
+        group_sizes = [0] * num_groups
+        block_indices = [0] * num_groups
+        for chunk in chunks:
+            num_blocks = len(chunk.block_ids)
+            if not group_sizes[chunk.config_idx]:
+                block_indices[chunk.config_idx] = (
+                    chunk.chunk_idx + 1
+                ) * self.config.blocks_per_chunk - num_blocks
+            group_sizes[chunk.config_idx] += num_blocks
+            src_block_ids.extend(chunk.block_ids)
+        return GPULoadStoreSpec(
+            src_block_ids, group_sizes=group_sizes, block_indices=block_indices
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -1871,24 +2088,22 @@ class OffloadingConnectorScheduler:
             self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
 
         # Flush jobs that contain re-allocated blocks.
-        if (
-            self._block_id_to_pending_jobs
-            and not self._block_id_to_pending_jobs.keys().isdisjoint(
-                self._current_batch_allocated_block_ids
-            )
-        ):
-            self._current_batch_jobs_to_flush.update(
-                jid
-                for bid in self._current_batch_allocated_block_ids
-                if bid in self._block_id_to_pending_jobs
-                for jid in self._block_id_to_pending_jobs[bid]
-            )
+        if self._block_id_to_pending_jobs:
+            for bid in self._current_batch_allocated_block_keys:
+                self._current_batch_jobs_to_flush.update(
+                    self._block_id_to_pending_jobs.get(bid, ())
+                )
 
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        # After the offers of this step, because a finished request can offer a
+        # chunk on a block that the pool gives out in this step.
+        overwrite_store_jobs = {}
+        if self._overwrite_map is not None:
+            overwrite_store_jobs = self._build_overwrite_store_jobs()
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=partial_store_jobs | normal_store_jobs,
+            store_jobs=overwrite_store_jobs | partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
 
@@ -1904,7 +2119,7 @@ class OffloadingConnectorScheduler:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
-        self._current_batch_allocated_block_ids = set()
+        self._current_batch_allocated_block_keys = {}
         return meta
 
     def has_pending_push_work(self) -> bool:
@@ -1971,6 +2186,13 @@ class OffloadingConnectorScheduler:
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
+
+            if job_status.trigger is StoreTrigger.ON_OVERWRITE:
+                self.manager.complete_store(
+                    job_status.keys, None, trigger=job_status.trigger
+                )
+                del self._jobs[job_id]
+                continue
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
@@ -2070,7 +2292,7 @@ class OffloadingConnectorScheduler:
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
         assert not self._current_batch_jobs_to_flush
-        assert not self._current_batch_allocated_block_ids
+        assert not self._current_batch_allocated_block_keys
 
         # Flush all in-flight jobs
         self._current_batch_jobs_to_flush.update(self._jobs.keys())
@@ -2095,6 +2317,8 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        if self._overwrite_map is not None:
+            self._overwrite_map.clear()
 
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.

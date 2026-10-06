@@ -1570,6 +1570,39 @@ def test_request_key_positions_order_tails_across_kv_groups():
     assert set(output.evicted_keys) == {group_0_tail, group_1_tail}
 
 
+def test_lazy_policy_stores_on_overwrite_after_request_finished():
+    manager = make_cpu_manager(store_admission_policy={"type": "lazy"})
+    keys = to_keys([1, 2])
+    ctx = make_req_context("lazy")
+
+    output = manager.prepare_store(keys, ctx)
+    assert output is not None
+    assert not output.keys_to_store
+    manager.on_request_finished(ctx)
+
+    output = manager.prepare_store(keys, None, StoreTrigger.ON_OVERWRITE)
+    assert output is not None
+    assert output.keys_to_store == keys
+    manager.complete_store(keys, None, trigger=StoreTrigger.ON_OVERWRITE)
+    assert manager.lookup(keys[0], _EMPTY_REQ_CTX) == LookupResult.HIT
+
+
+def test_lazy_overwrite_of_held_key_refreshes_its_recency():
+    manager = make_cpu_manager(num_chunks=2, store_admission_policy={"type": "lazy"})
+    first, second, third = to_keys([1, 2, 3])
+    for key in (first, second):
+        assert manager.prepare_store([key], None, StoreTrigger.ON_OVERWRITE)
+        manager.complete_store([key], None, trigger=StoreTrigger.ON_OVERWRITE)
+
+    output = manager.prepare_store([first], None, StoreTrigger.ON_OVERWRITE)
+    assert output is not None
+    assert not output.keys_to_store
+
+    output = manager.prepare_store([third], None, StoreTrigger.ON_OVERWRITE)
+    assert output is not None
+    assert output.evicted_keys == [second]
+
+
 class SkipKeysAdmissionPolicy(StoreAdmissionPolicy):
     """Refuses the configured keys, and records each admit call."""
 
@@ -1629,6 +1662,11 @@ def test_store_admission_policy_admits_a_subset_of_the_offer():
     assert output is not None
     assert output.keys_to_store == to_keys([2, 4])
     assert policy.offers[-1] == (to_keys([2, 3, 4]), ctx, StoreTrigger.ON_COMPUTE)
+
+
+def test_late_store_triggers_reject_store_threshold():
+    with pytest.raises(ValueError, match="store_threshold"):
+        make_cpu_manager(store_threshold=2, store_admission_policy={"type": "lazy"})
 
 
 def test_unknown_store_admission_policy_raises():

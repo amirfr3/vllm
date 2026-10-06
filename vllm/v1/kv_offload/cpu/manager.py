@@ -93,6 +93,12 @@ class CPUOffloadingManager(OffloadingManager):
         self._store_admission: StoreAdmissionPolicy = create_store_admission_policy(
             store_admission_policy
         )
+        if store_threshold >= 2 and self.store_triggers != {StoreTrigger.ON_COMPUTE}:
+            # A late store is the only offer of a chunk, so a threshold drops it.
+            raise ValueError(
+                "store_threshold >= 2 is not supported with store triggers "
+                f"{sorted(t.name for t in self.store_triggers)}"
+            )
 
         # Number of chunk references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -188,6 +194,39 @@ class CPUOffloadingManager(OffloadingManager):
             key for key in reused_keys if key not in state.inserted_keys
         )
 
+    def _record_store_offer(
+        self,
+        keys: list[OffloadKey],
+        keys_to_store: list[OffloadKey],
+        ready_existing_keys: list[OffloadKey],
+        req_context: ReqContext,
+    ) -> _RequestCacheAccess:
+        state = self._get_request_cache_access(req_context)
+        recorded_keys = set(keys_to_store)
+        recorded_keys.update(ready_existing_keys)
+        # Record once before any allocation-related early return. Store
+        # candidates are classified as insertions only after allocation succeeds.
+        self._record_request_cache_access(
+            (key for key in keys if key in recorded_keys),
+            req_context,
+            reused_keys=ready_existing_keys,
+        )
+        return state
+
+    def _record_store_misses(
+        self,
+        keys: list[OffloadKey],
+        state: _RequestCacheAccess | None,
+        req_context: ReqContext | None,
+    ) -> None:
+        if state is not None:
+            # One policy observation per request.
+            keys = [key for key in keys if key not in state.store_miss_keys]
+            state.store_miss_keys.update(keys)
+        if keys:
+            # ARC learns from B1/B2 before insert() removes the ghost entry.
+            self._policy.on_store_miss(keys, req_context)
+
     # --- OffloadingManager interface ---
 
     @property
@@ -270,7 +309,8 @@ class CPUOffloadingManager(OffloadingManager):
         trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ) -> PrepareStoreOutput | None:
         assert trigger in self.store_triggers, f"{trigger} not in {self.store_triggers}"
-        assert req_context is not None, "prepare_store requires a req_context"
+        # The request of an ON_OVERWRITE store is finished.
+        assert (req_context is None) == (trigger == StoreTrigger.ON_OVERWRITE)
         keys = list(keys)
         if self.counts is not None:
             self._record_accesses(keys)
@@ -298,16 +338,14 @@ class CPUOffloadingManager(OffloadingManager):
                 keys_to_store
             )
 
-        state = self._get_request_cache_access(req_context)
-        recorded_keys = set(keys_to_store)
-        recorded_keys.update(ready_existing_keys)
-        # Record once before any allocation-related early return. Store
-        # candidates are classified as insertions only after allocation succeeds.
-        self._record_request_cache_access(
-            (key for key in keys if key in recorded_keys),
-            req_context,
-            reused_keys=ready_existing_keys,
-        )
+        state: _RequestCacheAccess | None = None
+        if req_context is None:
+            # ON_OVERWRITE: the ON_COMPUTE offer of these keys recorded the access.
+            self._policy.touch(ready_existing_keys, None)
+        else:
+            state = self._record_store_offer(
+                keys, keys_to_store, ready_existing_keys, req_context
+            )
 
         # A refused key still counts as an access, but not as a store miss.
         if keys_to_store:
@@ -315,15 +353,8 @@ class CPUOffloadingManager(OffloadingManager):
                 self._store_admission.admit(keys_to_store, req_context, trigger)
             )
             keys_to_store = [key for key in keys_to_store if key in admitted]
-
-        new_store_misses = [
-            key for key in keys_to_store if key not in state.store_miss_keys
-        ]
-        if new_store_misses:
-            # ARC learns from B1/B2 before insert() removes the ghost entry.
-            # Deduplication makes this one policy observation per request.
-            self._policy.on_store_miss(new_store_misses, req_context)
-            state.store_miss_keys.update(new_store_misses)
+            # Before any allocation-related early return.
+            self._record_store_misses(keys_to_store, state, req_context)
 
         if not keys_to_store:
             return PrepareStoreOutput(
@@ -375,7 +406,9 @@ class CPUOffloadingManager(OffloadingManager):
         for key, chunk in zip(keys_to_store, chunks):
             self._policy.insert(key, chunk)
         self._num_write_pending_chunks += len(keys_to_store)
-        state.inserted_keys.update(keys_to_store)
+        # The state is None for an ON_OVERWRITE store.
+        if state is not None:
+            state.inserted_keys.update(keys_to_store)
 
         # build store specs for allocated chunks
         store_spec = self._get_load_store_spec(keys_to_store, chunks)

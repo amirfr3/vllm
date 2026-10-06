@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    GpuChunk,
     OffloadingConnectorScheduler,
     RequestOffloadState,
     _create_req_context,
@@ -72,6 +73,7 @@ from vllm.v1.kv_offload.base import (
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
+    StoreTrigger,
     get_offload_block_hash,
     get_offload_group_idx,
     make_offload_key,
@@ -1362,18 +1364,64 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
 
 
+_LAZY_EXTRA_CONFIG = {
+    "store_triggers": ["ON_COMPUTE", "ON_OVERWRITE"],
+    "self_describing_kv_events": False,
+}
+
+
+def _make_lazy_runner(request_runner, async_scheduling: bool, num_gpu_blocks: int):
+    """A runner whose manager refuses ON_COMPUTE and records each offer."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    offers: list[tuple[list, ReqContext | None, StoreTrigger]] = []
+
+    def prepare_store(keys, req_context, trigger=StoreTrigger.ON_COMPUTE):
+        offers.append((list(keys), req_context, trigger))
+        admitted = [] if trigger is StoreTrigger.ON_COMPUTE else keys
+        return generate_store_output(admitted)
+
+    runner.manager.prepare_store.side_effect = prepare_store
+    flushed_job_ids: list[int] = []
+    handler = runner.offloading_spec.handler
+    wait = handler.wait
+
+    def record_wait(job_ids):
+        flushed_job_ids.extend(job_ids)
+        wait(job_ids)
+
+    handler.wait = record_wait
+    return runner, offers, flushed_job_ids
+
+
+def _offered_keys(offers, trigger: StoreTrigger) -> list:
+    return [key for keys, _, t in offers if t is trigger for key in keys]
+
+
+def test_default_store_triggers_keep_no_overwrite_map(request_runner):
+    runner = request_runner(block_size=4, num_gpu_blocks=10, async_scheduling=False)
+    assert runner.connector_scheduler._overwrite_map is None
+
+
 @pytest.mark.parametrize(
-    "store_triggers",
-    [["ON_OVERWRITE"], ["ON_COMPUTE", "ON_OVERWRITE"]],
+    "extra_config",
+    [
+        {"store_triggers": ["ON_OVERWRITE"]},
+        {"store_triggers": ["ON_COMPUTE", "ON_OVERWRITE"]},
+    ],
 )
-def test_unsupported_store_triggers_raise(request_runner, store_triggers):
-    """The connector sends only ON_COMPUTE, so other store triggers raise."""
-    with pytest.raises(ValueError, match="store triggers"):
+def test_unsupported_store_triggers_raise(request_runner, extra_config):
+    """No ON_COMPUTE, or ON_OVERWRITE with self-describing events."""
+    with pytest.raises(ValueError):
         request_runner(
             block_size=4,
             num_gpu_blocks=10,
             async_scheduling=False,
-            extra_config_overrides={"store_triggers": store_triggers},
+            extra_config_overrides=extra_config,
         )
 
 
@@ -1408,6 +1456,261 @@ def test_on_compute_stores_do_not_pass_the_trigger(request_runner):
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
     assert len(completed) == 1
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lazy_death_stores_chunk_without_request_context(
+    request_runner, async_scheduling: bool
+):
+    runner, offers, flushed_job_ids = _make_lazy_runner(
+        request_runner, async_scheduling, num_gpu_blocks=8
+    )
+    runner.new_request(token_ids=list(range(12)))
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    first_keys = set(_offered_keys(offers, StoreTrigger.ON_COMPUTE))
+    assert first_keys
+    assert not _offered_keys(offers, StoreTrigger.ON_OVERWRITE)
+
+    # Fresh blocks for this request include blocks of the first request.
+    # The runner names each GPU block by its new position.
+    offers.clear()
+    runner.new_request(token_ids=list(range(100, 124)))
+    overwritten = (4, 5, 6) if async_scheduling else (4, 5)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=overwritten,
+        expected_flushed=overwritten,
+    )
+
+    dying_keys = _offered_keys(offers, StoreTrigger.ON_OVERWRITE)
+    assert dying_keys
+    assert set(dying_keys) <= first_keys
+    assert all(
+        req_context is None
+        for _, req_context, trigger in offers
+        if trigger is StoreTrigger.ON_OVERWRITE
+    )
+    handler = runner.offloading_spec.handler
+    flushed_keys = {
+        key
+        for job_id in flushed_job_ids
+        for key in handler.transfer_specs[job_id][1].offload_keys
+    }
+    assert set(dying_keys) <= flushed_keys
+    assert not runner.connector_scheduler._jobs
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lazy_prefix_hit_is_not_a_death(request_runner, async_scheduling: bool):
+    runner, offers, _ = _make_lazy_runner(
+        request_runner, async_scheduling, num_gpu_blocks=20
+    )
+    token_ids = list(range(12))
+    runner.new_request(token_ids=token_ids)
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+    offers.clear()
+    runner.new_request(token_ids=token_ids)
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    assert _offered_keys(offers, StoreTrigger.ON_COMPUTE)
+    assert not _offered_keys(offers, StoreTrigger.ON_OVERWRITE)
+
+
+def test_overwrite_store_jobs_isolate_partial_chunks(request_runner):
+    """Full chunks share a job deepest first. A partial chunk gets its own job."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=40,
+        async_scheduling=False,
+        blocks_per_chunk=4,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
+        generate_store_output(keys)
+    )
+    scheduler = runner.connector_scheduler
+    chunks = [
+        GpuChunk("k1", 0, 1, (10, 11, 12, 13), ("b10", "b11", "b12", "b13")),
+        GpuChunk("k2", 0, 2, (30, 31), ("b30", "b31")),
+        GpuChunk("k3", 0, 3, (20, 21, 22, 23), ("b20", "b21", "b22", "b23")),
+    ]
+    scheduler._overwrite_map.add(chunks)
+    # One block of each chunk is enough to overwrite the chunk.
+    scheduler._current_batch_allocated_block_keys = {10: None, 20: None, 30: None}
+
+    store_jobs = scheduler._build_overwrite_store_jobs()
+
+    assert [
+        (
+            job.src_spec.block_ids.tolist(),
+            job.src_spec.group_sizes,
+            job.src_spec.block_indices,
+            job.dst_spec.offload_keys,
+        )
+        for job in store_jobs.values()
+    ] == [
+        ([20, 21, 22, 23, 10, 11, 12, 13], [8], [12], ["k3", "k1"]),
+        ([30, 31], [2], [10], ["k2"]),
+    ]
+    assert scheduler._current_batch_jobs_to_flush == set(store_jobs)
+    assert scheduler._overwrite_map.by_block == {}
+    runner.manager.prepare_store.assert_has_calls(
+        [
+            call(["k3", "k1"], None, trigger=StoreTrigger.ON_OVERWRITE),
+            call(["k2"], None, trigger=StoreTrigger.ON_OVERWRITE),
+        ]
+    )
+
+
+def test_overwrite_keeps_chunk_of_block_with_same_data(request_runner):
+    """A block keeps its chunks only if the new owner expects the same block key.
+
+    A prefix hit on one block of a chunk keeps the chunk, even when the chunk
+    key of the new owner is different.
+    """
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        blocks_per_chunk=2,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    scheduler = runner.connector_scheduler
+    kept = GpuChunk("k1", 0, 0, (10, 11), ("b10", "b11"))
+    overwritten = GpuChunk("k2", 0, 1, (20, 21), ("b20", "b21"))
+    scheduler._overwrite_map.add([kept, overwritten])
+
+    assert scheduler._overwrite_map.take_overwritten({10: "b10", 20: "b99"}) == [
+        overwritten
+    ]
+    assert scheduler._overwrite_map.by_block == {10: [kept], 11: [kept]}
+
+
+def test_overwrite_takes_all_chunks_of_a_shared_block(request_runner):
+    """Two chunks that share a block both die when the shared block dies."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        blocks_per_chunk=2,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    scheduler = runner.connector_scheduler
+    chunks = [
+        GpuChunk("k1", 0, 0, (10, 11), ("b10", "b11")),
+        GpuChunk("k2", 0, 0, (10, 12), ("b10", "b12")),
+    ]
+    scheduler._overwrite_map.add(chunks)
+
+    assert scheduler._overwrite_map.take_overwritten({10: None}) == chunks
+    assert scheduler._overwrite_map.by_block == {}
+
+
+def test_overwrite_stores_one_copy_of_a_key(request_runner):
+    """Two dying chunks with the same key give one store."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=40,
+        async_scheduling=False,
+        blocks_per_chunk=2,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context, trigger: (
+        generate_store_output(keys)
+    )
+    scheduler = runner.connector_scheduler
+    scheduler._overwrite_map.add(
+        [
+            GpuChunk("k1", 0, 1, (10, 11), ("b10", "b11")),
+            GpuChunk("k1", 0, 1, (20, 21), ("b20", "b21")),
+        ]
+    )
+    scheduler._current_batch_allocated_block_keys = {10: None, 20: None}
+
+    store_jobs = scheduler._build_overwrite_store_jobs()
+
+    assert [job.dst_spec.offload_keys for job in store_jobs.values()] == [["k1"]]
+    assert scheduler._overwrite_map.by_block == {}
+
+
+def test_allocated_blocks_of_other_groups_get_new_data(request_runner):
+    """A group that is not offloaded shares the block pool, so its blocks die."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    scheduler = runner.connector_scheduler
+    req_status = SimpleNamespace(req=SimpleNamespace(block_hashes=[BlockHash(b"h0")]))
+
+    scheduler._add_allocated_blocks(req_status, ([5], [7]), [0])
+
+    assert scheduler._current_batch_allocated_block_keys == {
+        5: make_offload_key(BlockHash(b"h0"), 0),
+        7: None,
+    }
+
+
+def test_copy_destination_keeps_the_block_key_of_its_owner(request_runner):
+    """A CoW destination in a block table is not new data for its own chunk."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        extra_config_overrides=_LAZY_EXTRA_CONFIG,
+    )
+    scheduler = runner.connector_scheduler
+    scheduler._current_batch_allocated_block_keys = {5: "b5"}
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        ),
+        kv_cache_block_copies=[KVCacheBlockCopy(1, 5), KVCacheBlockCopy(2, 6)],
+    )
+
+    scheduler._update_req_states(scheduler_output)
+
+    assert scheduler._current_batch_allocated_block_keys == {5: "b5", 6: None}
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lazy_load_target_is_flushed_before_load(
+    request_runner, async_scheduling: bool
+):
+    """A load into a block of a finished request first stores the old chunk."""
+    # Async scheduling allocates one more block for the first request.
+    runner, offers, _ = _make_lazy_runner(
+        request_runner, async_scheduling, num_gpu_blocks=5 if async_scheduling else 4
+    )
+    runner.new_request(token_ids=list(range(12)))
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    first_keys = set(_offered_keys(offers, StoreTrigger.ON_COMPUTE))
+
+    handler = runner.offloading_spec.handler
+    worker_calls: list[str] = []
+    wait, submit_load = handler.wait, handler.submit_load
+
+    def record_wait(job_ids):
+        worker_calls.append("flush")
+        wait(job_ids)
+
+    def record_submit_load(job_id, src_spec, dst_spec):
+        worker_calls.append("load")
+        return submit_load(job_id, src_spec, dst_spec)
+
+    handler.wait = record_wait
+    handler.submit_load = record_submit_load
+    # All the free blocks belong to the first request.
+    offers.clear()
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 2
+    runner.new_request(token_ids=list(range(100, 112)))
+    runner._run(decoded_tokens=[EOS_TOKEN_ID], complete_transfers=True)
+
+    assert set(_offered_keys(offers, StoreTrigger.ON_OVERWRITE)) == first_keys
+    assert worker_calls.index("flush") < worker_calls.index("load")
+    assert not runner.connector_scheduler._jobs
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -4870,9 +5173,9 @@ class TestMambaHybridOffloadServing:
     MAMBA_BLOCK = 16
     PROMPT_TOKENS = 28  # 7 hash blocks; 1 full mamba chunk
 
-    def _make_scheduler(self, speculative_config, mamba_eagle=False):
+    def _make_scheduler(self, speculative_config, mamba_eagle=False, **extra_config):
         vllm_config = _make_vllm_config(
-            extra_config={"self_describing_kv_events": True}
+            extra_config={"self_describing_kv_events": True, **extra_config}
         )
         vllm_config.cache_config.block_size = self.BLOCK
         vllm_config.cache_config.prefix_match_unit = self.BLOCK
@@ -4907,6 +5210,15 @@ class TestMambaHybridOffloadServing:
         )
         spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
         return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+    def test_overwrite_stores_are_rejected(self):
+        """Lazy stores do not store the Mamba align state yet."""
+        with pytest.raises(ValueError, match="Mamba align"):
+            self._make_scheduler(
+                None,
+                store_triggers=["ON_COMPUTE", "ON_OVERWRITE"],
+                self_describing_kv_events=False,
+            )
 
     def _roundtrip_served_tokens(self, scheduler) -> int:
         """Request A: prompt-only store, finish; request A2: served tokens."""

@@ -102,6 +102,7 @@ def _group_config(
         tokens_per_block=block_size,
         tokens_per_chunk=tokens_per_chunk,
         hashes_per_chunk=tokens_per_chunk // tokens_per_hash,
+        hashes_per_block=block_size // tokens_per_hash,
         sliding_window_size_in_chunks=sliding_window_size_in_chunks,
         kv_cache_spec=kv_spec,
         manager_cls=manager_cls,

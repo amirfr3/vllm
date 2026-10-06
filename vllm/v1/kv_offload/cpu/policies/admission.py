@@ -54,8 +54,27 @@ class EagerStoreAdmissionPolicy(StoreAdmissionPolicy):
         return keys
 
 
+class LazyStoreAdmissionPolicy(StoreAdmissionPolicy):
+    """Stores a chunk only when HBM is about to lose it."""
+
+    @property
+    @override
+    def triggers(self) -> frozenset[StoreTrigger]:
+        return frozenset({StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE})
+
+    @override
+    def admit(
+        self,
+        keys: Sequence[OffloadKey],
+        req_context: ReqContext | None,
+        trigger: StoreTrigger,
+    ) -> Collection[OffloadKey]:
+        return () if trigger == StoreTrigger.ON_COMPUTE else keys
+
+
 _BUILTIN_POLICIES: dict[str, type[StoreAdmissionPolicy]] = {
     "eager": EagerStoreAdmissionPolicy,
+    "lazy": LazyStoreAdmissionPolicy,
 }
 
 

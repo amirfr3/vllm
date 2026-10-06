@@ -89,7 +89,7 @@ class LRUCachePolicy(CachePolicy):
         self._evictable.discard(key)
 
     @override
-    def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+    def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext | None) -> None:
         self._update_recency(reversed(list(keys)))
 
     @override
