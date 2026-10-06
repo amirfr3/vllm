@@ -1474,6 +1474,14 @@ def test_lazy_death_stores_chunk_without_request_context(
     # Fresh blocks for this request include blocks of the first request.
     # The runner names each GPU block by its new position.
     offers.clear()
+    completions: list[tuple[set, ReqContext | None, StoreTrigger]] = []
+
+    def complete_store(
+        keys, req_context, success=True, trigger=StoreTrigger.ON_COMPUTE
+    ):
+        completions.append((set(keys), req_context, trigger))
+
+    runner.manager.complete_store.side_effect = complete_store
     runner.new_request(token_ids=list(range(100, 124)))
     overwritten = (4, 5, 6) if async_scheduling else (4, 5)
     runner.run(
@@ -1498,6 +1506,13 @@ def test_lazy_death_stores_chunk_without_request_context(
     }
     assert set(dying_keys) <= flushed_keys
     assert not runner.connector_scheduler._jobs
+    # complete_store gets the trigger and the None context of prepare_store.
+    assert completions
+    assert all(
+        req_context is None and trigger is StoreTrigger.ON_OVERWRITE
+        for _, req_context, trigger in completions
+    )
+    assert set().union(*(keys for keys, _, _ in completions)) == set(dying_keys)
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
