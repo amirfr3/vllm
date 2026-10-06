@@ -1770,3 +1770,49 @@ def test_admit_is_not_called_without_new_keys():
     assert output is not None
     assert output.keys_to_store == []
     assert len(policy.offers) == num_offers
+
+
+def _overwrite_store(manager: CPUOffloadingManager, keys: list[OffloadKey]):
+    output = manager.prepare_store(keys, None, StoreTrigger.ON_OVERWRITE)
+    assert output is not None
+    manager.complete_store(keys, None, trigger=StoreTrigger.ON_OVERWRITE)
+    return output
+
+
+def _make_arc_ghost(store_admission_policy: dict | None):
+    """Return an ARC manager with one chunk, and a key in B1."""
+    manager = make_cpu_manager(
+        num_chunks=1, cache_policy="arc", store_admission_policy=store_admission_policy
+    )
+    policy = manager._policy
+    assert isinstance(policy, ARCCachePolicy)
+    ghost, other = to_keys([1, 2])
+    return manager, policy, ghost, other
+
+
+def test_arc_overwrite_store_of_a_ghost_key_adapts_once():
+    """In lazy mode, ARC sees a ghost hit at the store, not at the refused offer."""
+    manager, policy, ghost, other = _make_arc_ghost({"type": "lazy"})
+    _overwrite_store(manager, [ghost])
+    _overwrite_store(manager, [other])
+    assert ghost in policy.b1
+
+    # A refused ON_COMPUTE offer of the ghost key is not a store miss.
+    assert manager.prepare_store([ghost], make_req_context("recompute"))
+    assert policy.target_t1_size == 0
+
+    _overwrite_store(manager, [ghost])
+    assert policy.target_t1_size == 1
+    assert ghost in policy.t1
+
+
+def test_arc_compute_store_of_a_ghost_key_stays_in_t1():
+    """The eager store path does not change."""
+    manager, policy, ghost, other = _make_arc_ghost(None)
+    for key in (ghost, other, ghost):
+        ctx = make_req_context(str(key))
+        assert manager.prepare_store([key], ctx)
+        manager.complete_store([key], ctx)
+
+    assert policy.target_t1_size == 1
+    assert ghost in policy.t1
