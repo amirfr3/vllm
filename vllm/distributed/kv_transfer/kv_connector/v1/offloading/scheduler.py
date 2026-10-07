@@ -86,6 +86,8 @@ class TransferJobStatus:
     fenced_block_ids: list[int] | None = None
     # Passed to manager.complete_store() with the same value as prepare_store().
     trigger: StoreTrigger = StoreTrigger.ON_COMPUTE
+    # The loaded group chunks to add to the overwrite map when the load completes.
+    loaded_chunks: list["GpuChunk"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1295,13 +1297,13 @@ class OffloadingConnectorScheduler:
 
         keys_to_load: list[OffloadKey] = []
         req_status.load_key_ranges.clear()
+        loaded_chunks: list[GpuChunk] = []
         dst_block_ids: list[int] = []
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
-        for group_config, group_state in zip(
-            self.config.kv_group_configs,
-            req_status.group_states,
+        for config_idx, (group_config, group_state) in enumerate(
+            zip(self.config.kv_group_configs, req_status.group_states)
         ):
             group_blocks = blocks.blocks[group_config.group_idx]
             tokens_per_block = group_config.tokens_per_block
@@ -1344,6 +1346,19 @@ class OffloadingConnectorScheduler:
                 end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
                 assert len(offload_keys) >= end_chunk_idx
                 group_keys_to_load = offload_keys[start_chunk_idx:end_chunk_idx]
+                # A load skips the ON_COMPUTE offer of its chunks.
+                if self._overwrite_map is not None:
+                    group_block_ids = [block.block_id for block in group_blocks]
+                    loaded_chunks.extend(
+                        self._make_gpu_chunk(
+                            request,
+                            config_idx,
+                            chunk_idx,
+                            offload_keys[chunk_idx],
+                            group_block_ids,
+                        )
+                        for chunk_idx in range(start_chunk_idx, end_chunk_idx)
+                    )
                 if partial_tail_boundary is not None:
                     group_keys_to_load.append(
                         self._make_boundary_key(
@@ -1404,6 +1419,7 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
+            loaded_chunks=loaded_chunks,
         )
 
         if self._chunks_being_loaded is not None:
@@ -2199,6 +2215,9 @@ class OffloadingConnectorScheduler:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                if job_status.loaded_chunks:
+                    assert self._overwrite_map is not None
+                    self._overwrite_map.add(job_status.loaded_chunks)
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:

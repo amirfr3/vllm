@@ -1729,6 +1729,35 @@ def test_lazy_load_target_is_flushed_before_load(
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_lazy_offers_loaded_chunks_at_overwrite(request_runner, async_scheduling: bool):
+    """The CPU can evict a loaded chunk while HBM holds it, so HBM must offer it."""
+    runner, offers, _ = _make_lazy_runner(
+        request_runner, async_scheduling, num_gpu_blocks=5 if async_scheduling else 4
+    )
+    loaded_keys: list = []
+    prepare_load = runner.manager.prepare_load
+
+    def record_prepare_load(keys, req_context):
+        loaded_keys.extend(keys)
+        return prepare_load(keys, req_context)
+
+    runner.manager.prepare_load = record_prepare_load
+    scheduler = runner.connector_scheduler
+    scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 2
+    runner.new_request(token_ids=list(range(12)))
+    runner._run(decoded_tokens=[EOS_TOKEN_ID], complete_transfers=True)
+    assert len(loaded_keys) == 2
+
+    del scheduler._maximal_prefix_lookup
+    offers.clear()
+    # All the free blocks belong to the first request.
+    runner.new_request(token_ids=list(range(100, 112)))
+    runner._run(decoded_tokens=[EOS_TOKEN_ID], complete_transfers=True)
+
+    assert set(loaded_keys) <= set(_offered_keys(offers, StoreTrigger.ON_OVERWRITE))
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_on_request_finished_not_deferred_until_store_completion(
     request_runner, async_scheduling: bool
 ):
