@@ -409,6 +409,7 @@ def _make_align_handoff_scheduler(
     vllm_config = _make_vllm_config(extra_config=extra_config)
     vllm_config.cache_config.prefix_match_unit = 4
     vllm_config.speculative_config = None
+    vllm_config.use_v2_model_runner = False
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
@@ -454,6 +455,23 @@ def _make_lazy_align_handoff(cpu_has_key: bool = False) -> OffloadingConnectorSc
     [chunk] = scheduler._overwrite_map.by_block[99]
     assert chunk.block_keys == (chunk.key,)
     return scheduler
+
+
+@pytest.mark.parametrize("use_v2_model_runner", [False, True], ids=["v1", "v2"])
+def test_lazy_with_kv_cache_zeroing_needs_the_v1_runner(use_v2_model_runner: bool):
+    """V2 zeroes a reused block before the ON_OVERWRITE store reads it."""
+    vllm_config = _make_vllm_config(extra_config=_LAZY_EXTRA_CONFIG)
+    vllm_config.use_v2_model_runner = use_v2_model_runner
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    assert kv_cache_config.needs_kv_cache_zeroing
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+
+    if not use_v2_model_runner:
+        scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+        assert scheduler._overwrite_map is not None
+        return
+    with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=0"):
+        OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
 
 def test_lazy_aligned_boundary_is_kept_at_a_prefix_hit():

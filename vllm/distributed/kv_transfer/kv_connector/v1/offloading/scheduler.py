@@ -714,6 +714,17 @@ class OffloadingConnectorScheduler:
                     "self_describing_kv_events is not supported with "
                     "ON_OVERWRITE stores"
                 )
+            # The V2 model runner zeroes new blocks and applies the CoW copies
+            # before handle_preemptions, so an ON_OVERWRITE store would read them.
+            if (
+                vllm_config.use_v2_model_runner
+                and kv_cache_config.needs_kv_cache_zeroing
+            ):
+                raise ValueError(
+                    "ON_OVERWRITE stores are not supported with the V2 model "
+                    "runner when the KV cache needs zeroing (Mamba layers or "
+                    "mixed-precision KV cache). Set VLLM_USE_V2_MODEL_RUNNER=0."
+                )
             self._overwrite_map = OverwriteMap()
 
     def _maybe_observe_lookup_async_delay(
