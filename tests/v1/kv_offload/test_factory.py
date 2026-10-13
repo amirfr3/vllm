@@ -14,6 +14,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
+    StoreTrigger,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -22,6 +23,8 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.admission import EagerStoreAdmissionPolicy
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -104,6 +107,15 @@ class SingleArgExternalOffloadingSpec(OffloadingSpec):
         raise NotImplementedError
 
 
+_OVERWRITE_TRIGGERS = frozenset({StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE})
+
+
+class OverwriteAdmissionPolicy(EagerStoreAdmissionPolicy):
+    @property
+    def triggers(self) -> frozenset[StoreTrigger]:
+        return _OVERWRITE_TRIGGERS
+
+
 def test_pre_registered_specs_can_be_imported():
     for name in OffloadingSpecFactory._registry:
         cls = OffloadingSpecFactory._registry[name]()
@@ -167,6 +179,43 @@ def test_cpu_spec_zero_worker_bytes_produces_empty_cache():
     assert spec.cpu_page_size_per_worker == 0
     assert spec.kv_bytes_per_chunk == 0
     assert spec.num_chunks == 0
+
+
+def test_cpu_spec_reads_store_admission_policy_from_extra_config():
+    spec = _create_spec(
+        extra_config={
+            "store_admission_policy": {
+                "type": "OverwriteAdmissionPolicy",
+                "module_path": __name__,
+            }
+        }
+    )
+
+    manager = spec.get_manager()
+
+    assert isinstance(manager, CPUOffloadingManager)
+    assert manager.store_triggers == _OVERWRITE_TRIGGERS
+
+
+@pytest.mark.parametrize(
+    "store_admission_policy",
+    [
+        {"type": "unknown"},
+        {"type": "OverwriteAdmissionPolicy", "module_path": __name__},
+        {"type": "eager", "module_path": __name__},
+        {"type": "eager", "unknown_arg": 1},
+    ],
+)
+def test_tiering_spec_rejects_non_eager_store_admission_policy(
+    store_admission_policy: dict[str, Any],
+):
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        extra_config={"store_admission_policy": store_admission_policy},
+    )
+
+    with pytest.raises(ValueError, match="supports only the 'eager'"):
+        spec.get_manager()
 
 
 def test_tiering_spec_aligns_row_size():

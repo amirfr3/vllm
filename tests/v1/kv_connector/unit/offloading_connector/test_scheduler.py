@@ -1362,6 +1362,54 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
 
 
+@pytest.mark.parametrize(
+    "store_triggers",
+    [["ON_OVERWRITE"], ["ON_COMPUTE", "ON_OVERWRITE"]],
+)
+def test_unsupported_store_triggers_raise(request_runner, store_triggers):
+    """The connector sends only ON_COMPUTE, so other store triggers raise."""
+    with pytest.raises(ValueError, match="store triggers"):
+        request_runner(
+            block_size=4,
+            num_gpu_blocks=10,
+            async_scheduling=False,
+            extra_config_overrides={"store_triggers": store_triggers},
+        )
+
+
+def test_on_compute_stores_do_not_pass_the_trigger(request_runner):
+    """A manager with no trigger parameter, from before StoreTrigger, still works.
+
+    The connector gives the trigger only for triggers other than ON_COMPUTE.
+    """
+    tokens_per_block = 4
+    blocks_per_chunk = 3
+    runner = request_runner(
+        blocks_per_chunk=blocks_per_chunk,
+        block_size=tokens_per_block,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+    )
+    runner.new_request(token_ids=[0] * tokens_per_block * blocks_per_chunk)
+    completed: list[Any] = []
+
+    # The signatures of a manager from before StoreTrigger. A trigger keyword
+    # raises TypeError.
+    def prepare_store(keys, req_context):
+        return generate_store_output(keys)
+
+    def complete_store(keys, req_context, success=True):
+        completed.append(keys)
+
+    runner.manager.prepare_store.side_effect = prepare_store
+    runner.manager.complete_store.side_effect = complete_store
+
+    runner.run(decoded_tokens=[0, 0], expected_stored=(0, 1, 2))
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+
+    assert len(completed) == 1
+
+
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_on_request_finished_not_deferred_until_store_completion(
     request_runner, async_scheduling: bool

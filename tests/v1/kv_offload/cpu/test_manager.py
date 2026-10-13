@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,6 +15,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     PrepareStoreOutput,
     ReqContext,
+    StoreTrigger,
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.common import (
@@ -22,6 +23,10 @@ from vllm.v1.kv_offload.cpu.common import (
     CPUOffloadingMetrics,
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.admission import (
+    EagerStoreAdmissionPolicy,
+    StoreAdmissionPolicy,
+)
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
@@ -43,6 +48,7 @@ def make_cpu_manager(
     enable_events: bool = False,
     store_threshold: int = 0,
     max_tracker_size: int = 64_000,
+    store_admission_policy: dict | None = None,
 ) -> CPUOffloadingManager:
     return CPUOffloadingManager(
         num_chunks=num_chunks,
@@ -51,6 +57,7 @@ def make_cpu_manager(
         enable_events=enable_events,
         store_threshold=store_threshold,
         max_tracker_size=max_tracker_size,
+        store_admission_policy=store_admission_policy,
     )
 
 
@@ -1561,3 +1568,167 @@ def test_request_key_positions_order_tails_across_kv_groups():
     output = manager.prepare_store(to_keys([10, 11]), make_req_context("evict"))
     assert output is not None
     assert set(output.evicted_keys) == {group_0_tail, group_1_tail}
+
+
+class SkipKeysAdmissionPolicy(StoreAdmissionPolicy):
+    """Refuses the configured keys, and records each admit call."""
+
+    def __init__(self, refused: list[int]):
+        self.refused = set(to_keys(refused))
+        self.offers: list[tuple[list[OffloadKey], ReqContext | None, StoreTrigger]] = []
+
+    def admit(
+        self,
+        keys: Sequence[OffloadKey],
+        req_context: ReqContext | None,
+        trigger: StoreTrigger,
+    ) -> Collection[OffloadKey]:
+        self.offers.append((list(keys), req_context, trigger))
+        return [key for key in keys if key not in self.refused]
+
+
+class ShadowEagerAdmissionPolicy(EagerStoreAdmissionPolicy):
+    """Asks for ON_OVERWRITE, so that a test can see which class is used."""
+
+    @property
+    def triggers(self) -> frozenset[StoreTrigger]:
+        return frozenset({StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE})
+
+
+class NotAnAdmissionPolicy:
+    pass
+
+
+# Shadows the built-in "eager" name, to test that the built-in policy wins.
+eager = ShadowEagerAdmissionPolicy
+
+
+def make_skip_keys_manager(
+    refused: list[int], num_chunks: int = 8
+) -> CPUOffloadingManager:
+    return make_cpu_manager(
+        num_chunks=num_chunks,
+        store_admission_policy={
+            "type": "SkipKeysAdmissionPolicy",
+            "module_path": __name__,
+            "refused": refused,
+        },
+    )
+
+
+def test_store_admission_policy_admits_a_subset_of_the_offer():
+    """Only the admitted keys are stored. admit sees only new keys, and the request."""
+    manager = make_skip_keys_manager(refused=[3])
+    policy = manager._store_admission
+    assert manager.prepare_store(to_keys([1]), make_req_context("a"))
+    manager.complete_store(to_keys([1]), make_req_context("a"))
+
+    ctx = make_req_context("b")
+    output = manager.prepare_store(to_keys([1, 2, 3, 4]), ctx)
+
+    assert output is not None
+    assert output.keys_to_store == to_keys([2, 4])
+    assert policy.offers[-1] == (to_keys([2, 3, 4]), ctx, StoreTrigger.ON_COMPUTE)
+
+
+def test_unknown_store_admission_policy_raises():
+    with pytest.raises(ValueError, match="Unknown store admission policy"):
+        make_cpu_manager(store_admission_policy={"type": "unknown"})
+
+
+@pytest.mark.parametrize("config", [None, {}, {"type": "eager"}])
+def test_eager_store_admission_policy_is_the_default(config):
+    manager = make_cpu_manager(store_admission_policy=config)
+    assert manager.store_triggers == {StoreTrigger.ON_COMPUTE}
+
+
+def test_out_of_tree_class_that_is_not_a_policy_raises():
+    with pytest.raises(AssertionError):
+        make_cpu_manager(
+            store_admission_policy={
+                "type": "NotAnAdmissionPolicy",
+                "module_path": __name__,
+            }
+        )
+
+
+def test_missing_out_of_tree_policy_class_raises():
+    with pytest.raises(AttributeError, match="Class Missing not found in"):
+        make_cpu_manager(
+            store_admission_policy={"type": "Missing", "module_path": __name__}
+        )
+
+
+def test_builtin_policy_name_takes_priority_over_module_path():
+    manager = make_cpu_manager(
+        store_admission_policy={"type": "eager", "module_path": __name__}
+    )
+    assert manager.store_triggers == {StoreTrigger.ON_COMPUTE}
+
+
+def test_refused_keys_take_no_space_and_stay_unloadable():
+    """A refusal on a full cache evicts nothing, and gives an empty output."""
+    manager = make_skip_keys_manager(refused=[3], num_chunks=2)
+    seed_ctx = make_req_context("seed")
+    assert manager.prepare_store(to_keys([1, 2]), seed_ctx)
+    manager.complete_store(to_keys([1, 2]), seed_ctx)
+
+    output = manager.prepare_store(to_keys([3]), make_req_context("refused"))
+
+    assert output is not None
+    assert output.keys_to_store == []
+    assert output.evicted_keys == []
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+
+def test_eviction_makes_space_only_for_admitted_keys():
+    manager = make_skip_keys_manager(refused=[3], num_chunks=2)
+    seed_ctx = make_req_context("seed")
+    assert manager.prepare_store(to_keys([1, 2]), seed_ctx)
+    manager.complete_store(to_keys([1, 2]), seed_ctx)
+
+    output = manager.prepare_store(to_keys([3, 4]), make_req_context("mixed"))
+
+    assert output is not None
+    assert output.keys_to_store == to_keys([4])
+    assert output.evicted_keys == to_keys([1])
+
+
+def test_refused_key_is_not_a_store_miss_or_an_insertion(monkeypatch):
+    """A refused key is not a store miss, so ARC does not adapt on each offer."""
+    manager = make_skip_keys_manager(refused=[1])
+    store_miss_calls = []
+    finalized = []
+
+    def on_store_miss(keys, req_context):
+        store_miss_calls.append((list(keys), req_context))
+
+    def on_request_finished(key_groups, insertion_only_keys, reused_keys, req_context):
+        finalized.append((key_groups, insertion_only_keys, reused_keys, req_context))
+
+    monkeypatch.setattr(manager._policy, "on_store_miss", on_store_miss)
+    monkeypatch.setattr(manager._policy, "on_request_finished", on_request_finished)
+
+    ctx = make_req_context("refused")
+    assert manager.prepare_store(to_keys([1]), ctx)
+    manager.on_request_finished(ctx)
+
+    assert store_miss_calls == []
+    assert finalized == [(((to_key(1),),), set(), set(), ctx)]
+
+
+def test_admit_is_not_called_without_new_keys():
+    manager = make_skip_keys_manager(refused=[])
+    policy = manager._store_admission
+    ctx = make_req_context("seed")
+    assert manager.prepare_store(to_keys([1]), ctx)
+    manager.complete_store(to_keys([1]), ctx)
+    num_offers = len(policy.offers)
+
+    output = manager.prepare_store(to_keys([1]), make_req_context("reuse"))
+
+    assert output is not None
+    assert output.keys_to_store == []
+    assert len(policy.offers) == num_offers

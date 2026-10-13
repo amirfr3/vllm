@@ -53,6 +53,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     PrepareStoreOutput,
     RequestOffloadingContext,
+    StoreTrigger,
     TransferResult,
     make_offload_key,
 )
@@ -133,6 +134,10 @@ class MockOffloadingSpec(OffloadingSpec):
         self.manager.get_load_source.return_value = CacheHitSource.EXTERNAL_UNSPECIFIED
         self.manager.get_stats.return_value = None
         self.manager.on_new_request.return_value = RequestOffloadingContext()
+        self.manager.store_triggers = frozenset(
+            StoreTrigger[name]
+            for name in self.extra_config.get("store_triggers", ["ON_COMPUTE"])
+        )
         self.handler = MockOffloadingWorker()
 
     def get_manager(self) -> OffloadingManager:

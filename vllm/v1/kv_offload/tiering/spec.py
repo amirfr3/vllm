@@ -342,6 +342,14 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 raise ValueError(
                     "store_threshold is not supported for TieringOffloadingSpec"
                 )
+            store_admission_policy = (
+                self.extra_config.get("store_admission_policy") or {}
+            )
+            if store_admission_policy and store_admission_policy != {"type": "eager"}:
+                raise ValueError(
+                    "TieringOffloadingSpec supports only the 'eager' "
+                    "store_admission_policy, with no other keys"
+                )
 
             scheduler_mmap: SharedOffloadRegion | None = None
             primary_tier: CPUPrimaryTierOffloadingManager | None = None

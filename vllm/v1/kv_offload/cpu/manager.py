@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 from typing_extensions import override
 
@@ -19,11 +20,16 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    StoreTrigger,
     get_offload_group_idx,
 )
 from vllm.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
     CPUOffloadingMetrics,
+)
+from vllm.v1.kv_offload.cpu.policies.admission import (
+    StoreAdmissionPolicy,
+    create_store_admission_policy,
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
@@ -63,6 +69,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        store_admission_policy: dict[str, Any] | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -83,6 +90,9 @@ class CPUOffloadingManager(OffloadingManager):
         self.stores_skipped_in_current_batch: int = 0
         self.allocation_sizes_in_current_batch: list[int] = []
         self._cache_generation = 0
+        self._store_admission: StoreAdmissionPolicy = create_store_admission_policy(
+            store_admission_policy
+        )
 
         # Number of chunk references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -180,6 +190,11 @@ class CPUOffloadingManager(OffloadingManager):
 
     # --- OffloadingManager interface ---
 
+    @property
+    @override
+    def store_triggers(self) -> frozenset[StoreTrigger]:
+        return self._store_admission.triggers
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         self._get_request_cache_access(req_context)
@@ -251,8 +266,11 @@ class CPUOffloadingManager(OffloadingManager):
     def prepare_store(
         self,
         keys: Collection[OffloadKey],
-        req_context: ReqContext,
+        req_context: ReqContext | None,
+        trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ) -> PrepareStoreOutput | None:
+        assert trigger in self.store_triggers, f"{trigger} not in {self.store_triggers}"
+        assert req_context is not None, "prepare_store requires a req_context"
         keys = list(keys)
         if self.counts is not None:
             self._record_accesses(keys)
@@ -281,15 +299,6 @@ class CPUOffloadingManager(OffloadingManager):
             )
 
         state = self._get_request_cache_access(req_context)
-        new_store_misses = [
-            key for key in keys_to_store if key not in state.store_miss_keys
-        ]
-        if new_store_misses:
-            # ARC learns from B1/B2 before insert() removes the ghost entry.
-            # Deduplication makes this one policy observation per request.
-            self._policy.on_store_miss(new_store_misses, req_context)
-            state.store_miss_keys.update(new_store_misses)
-
         recorded_keys = set(keys_to_store)
         recorded_keys.update(ready_existing_keys)
         # Record once before any allocation-related early return. Store
@@ -299,6 +308,22 @@ class CPUOffloadingManager(OffloadingManager):
             req_context,
             reused_keys=ready_existing_keys,
         )
+
+        # A refused key still counts as an access, but not as a store miss.
+        if keys_to_store:
+            admitted = set(
+                self._store_admission.admit(keys_to_store, req_context, trigger)
+            )
+            keys_to_store = [key for key in keys_to_store if key in admitted]
+
+        new_store_misses = [
+            key for key in keys_to_store if key not in state.store_miss_keys
+        ]
+        if new_store_misses:
+            # ARC learns from B1/B2 before insert() removes the ghost entry.
+            # Deduplication makes this one policy observation per request.
+            self._policy.on_store_miss(new_store_misses, req_context)
+            state.store_miss_keys.update(new_store_misses)
 
         if not keys_to_store:
             return PrepareStoreOutput(
@@ -365,8 +390,9 @@ class CPUOffloadingManager(OffloadingManager):
     def complete_store(
         self,
         keys: Collection[OffloadKey],
-        req_context: ReqContext,
+        req_context: ReqContext | None,
         success: bool = True,
+        trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ) -> None:
         stored_keys: list[OffloadKey] = []
 

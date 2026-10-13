@@ -53,6 +53,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
+    StoreTrigger,
     TierFilter,
     TierMatcher,
     make_offload_key,
@@ -635,6 +636,13 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+        store_triggers = self.manager.store_triggers
+        if store_triggers != {StoreTrigger.ON_COMPUTE}:
+            raise ValueError(
+                "The offloading connector supports only ON_COMPUTE stores, got "
+                f"store triggers {sorted(t.name for t in store_triggers)}"
+            )
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState

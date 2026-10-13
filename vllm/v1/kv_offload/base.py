@@ -126,6 +126,16 @@ class LookupResult(Enum):
     RETRY = auto()
 
 
+class StoreTrigger(Enum):
+    """Why the connector asks the manager to store the keys."""
+
+    # The chunks are complete. The eager store.
+    ON_COMPUTE = auto()
+    # The block pool gives blocks of the chunks to new requests in this step.
+    # req_context is None, and the call can come after on_request_finished.
+    ON_OVERWRITE = auto()
+
+
 class OffloadPolicy(Enum):
     # Offload only newly-computed chunks as they arrive; prefix-hit
     # chunks (already offloaded by a prior request) are skipped.
@@ -308,7 +318,8 @@ class OffloadingManager(ABC):
     def prepare_store(
         self,
         keys: Collection[OffloadKey],
-        req_context: ReqContext,
+        req_context: ReqContext | None,
+        trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ) -> PrepareStoreOutput | None:
         """Prepare the given blocks to be offloaded.
         The given blocks will be protected from eviction until
@@ -317,6 +328,9 @@ class OffloadingManager(ABC):
         Args:
             keys: the keys identifying the blocks.
             req_context: per-request context (e.g. kv_transfer_params).
+                None for StoreTrigger.ON_OVERWRITE.
+            trigger: why the connector asks for the store. The connector
+                sends only the triggers in store_triggers.
 
         Returns:
             A PrepareStoreOutput indicating which blocks need storing,
@@ -330,8 +344,9 @@ class OffloadingManager(ABC):
     def complete_store(
         self,
         keys: Collection[OffloadKey],
-        req_context: ReqContext,
+        req_context: ReqContext | None,
         success: bool = True,
+        trigger: StoreTrigger = StoreTrigger.ON_COMPUTE,
     ):
         """Marks blocks which were previously prepared to be stored, as stored.
         Following this call, the blocks become loadable.
@@ -341,10 +356,17 @@ class OffloadingManager(ABC):
         Args:
             keys: the keys identifying the blocks.
             req_context: per-request context (e.g. kv_transfer_params).
+                None for StoreTrigger.ON_OVERWRITE.
             success: whether the blocks were stored successfully.
+            trigger: the trigger given to the matching prepare_store.
 
         """
         return
+
+    @property
+    def store_triggers(self) -> frozenset[StoreTrigger]:
+        """The store triggers that this manager asks the connector for."""
+        return frozenset({StoreTrigger.ON_COMPUTE})
 
     @abstractmethod
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
