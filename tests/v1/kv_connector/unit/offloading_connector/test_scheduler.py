@@ -399,6 +399,149 @@ def test_aligned_boundary_store_flushes_before_block_reuse(cow_reuse):
     assert meta.jobs_to_flush == {job_id}
 
 
+def _make_align_handoff_scheduler(
+    lazy: bool, cpu_has_key: bool = False
+) -> OffloadingConnectorScheduler:
+    """A Mamba align scheduler with 2 blocks per chunk and a 40-token request."""
+    extra_config: dict[str, Any] = {"blocks_per_chunk": 2}
+    if lazy:
+        extra_config.update(_LAZY_EXTRA_CONFIG)
+    vllm_config = _make_vllm_config(extra_config=extra_config)
+    vllm_config.cache_config.prefix_match_unit = 4
+    vllm_config.speculative_config = None
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    request = _make_partial_tail_request(scheduler)
+    request.num_prompt_tokens = request.num_tokens = 40
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(10)]
+
+    def prepare_store(keys, req_context, trigger=StoreTrigger.ON_COMPUTE):
+        refused = (lazy and trigger is StoreTrigger.ON_COMPUTE) or cpu_has_key
+        return generate_store_output([] if refused else keys)
+
+    scheduler.manager.prepare_store.side_effect = prepare_store
+    return scheduler
+
+
+def _align_handoff_output() -> SchedulerOutput:
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, 32)]},
+    )
+    return output
+
+
+def _alloc_align_block(
+    scheduler: OffloadingConnectorScheduler, block_idx: int = 1, hashed: bool = False
+) -> None:
+    """Report Mamba block 99 at block_idx of the request as allocated."""
+    block = KVCacheBlock(99)
+    if hashed:
+        block.set_block_hash(make_block_hash_with_group_id(BlockHash(b"h"), 1), 32)
+    blocks = [KVCacheBlock(0, is_null=True)] * 2
+    blocks[block_idx] = block
+    req = scheduler._req_status["req"].req
+    scheduler.update_state_after_alloc(req, KVCacheBlocks(([], blocks)), 0)
+
+
+def _make_lazy_align_handoff(cpu_has_key: bool = False) -> OffloadingConnectorScheduler:
+    """A lazy scheduler with the hand-off of block 99 in the overwrite map."""
+    scheduler = _make_align_handoff_scheduler(lazy=True, cpu_has_key=cpu_has_key)
+    assert not scheduler.build_connector_meta(_align_handoff_output()).store_jobs
+    [chunk] = scheduler._overwrite_map.by_block[99]
+    assert chunk.block_keys == (chunk.key,)
+    return scheduler
+
+
+def test_lazy_aligned_boundary_is_kept_at_a_prefix_hit():
+    """A prefix hit on the hand-off block keeps the Mamba state."""
+    scheduler = _make_lazy_align_handoff()
+    _alloc_align_block(scheduler, hashed=True)
+
+    assert not scheduler.build_connector_meta(SchedulerOutput.make_empty()).store_jobs
+    assert len(scheduler._overwrite_map.by_block[99]) == 1
+
+
+@pytest.mark.parametrize("cpu_has_key", [False, True])
+def test_lazy_aligned_boundary_is_stored_when_a_fresh_block_expects_its_key(
+    cpu_has_key: bool,
+):
+    """A fresh block gets new Mamba state, also at the same position."""
+    eager = _make_align_handoff_scheduler(lazy=False)
+    [eager_job] = eager.build_connector_meta(
+        _align_handoff_output()
+    ).store_jobs.values()
+    scheduler = _make_lazy_align_handoff(cpu_has_key=cpu_has_key)
+    [chunk] = scheduler._overwrite_map.by_block[99]
+
+    _alloc_align_block(scheduler)
+    meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+
+    scheduler.manager.prepare_store.assert_called_with(
+        [chunk.key], None, trigger=StoreTrigger.ON_OVERWRITE
+    )
+    assert not scheduler._overwrite_map.by_block
+    if cpu_has_key:
+        assert not meta.store_jobs
+        return
+    [(job_id, job)] = meta.store_jobs.items()
+    assert meta.jobs_to_flush == {job_id}
+    assert job.src_spec.block_ids.tolist() == [99]
+    assert job.src_spec.group_sizes == eager_job.src_spec.group_sizes == [0, 1]
+    assert job.src_spec.block_indices == eager_job.src_spec.block_indices == [0, 1]
+
+
+def test_lazy_aligned_boundary_is_kept_when_handed_off_again():
+    """A fresh block that gets the same hand-off in its step keeps the entry."""
+    scheduler = _make_lazy_align_handoff()
+    _alloc_align_block(scheduler)
+
+    assert not scheduler.build_connector_meta(_align_handoff_output()).store_jobs
+    assert len(scheduler._overwrite_map.by_block[99]) == 1
+
+
+def test_lazy_aligned_boundary_is_kept_when_handed_off_on_a_new_block():
+    """A hand-off on a block allocated in the same step is not stored yet."""
+    scheduler = _make_align_handoff_scheduler(lazy=True)
+    _alloc_align_block(scheduler)
+
+    assert not scheduler.build_connector_meta(_align_handoff_output()).store_jobs
+    assert len(scheduler._overwrite_map.by_block[99]) == 1
+
+
+def test_lazy_aligned_boundary_is_stored_when_its_block_gets_another_key():
+    """A hit on the hand-off block at another position stores the state."""
+    scheduler = _make_lazy_align_handoff()
+    _alloc_align_block(scheduler, block_idx=0, hashed=True)
+
+    assert scheduler.build_connector_meta(SchedulerOutput.make_empty()).store_jobs
+    assert not scheduler._overwrite_map.by_block
+
+
+def test_lazy_loaded_aligned_chunk_is_its_boundary_block():
+    """A loaded Mamba align chunk holds only its last block, with its key."""
+    scheduler = _make_align_handoff_scheduler(lazy=True)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    req = req_status.req
+    blocks = KVCacheBlocks(
+        (
+            [KVCacheBlock(11), KVCacheBlock(12)],
+            [KVCacheBlock(98), KVCacheBlock(99)],
+        )
+    )
+    scheduler.update_state_after_alloc(req, blocks, 32)
+
+    [job_status] = scheduler._jobs.values()
+    key = make_offload_key(BlockHash(b"h7"), 1)
+    assert [c for c in job_status.loaded_chunks if c.config_idx == 1] == [
+        GpuChunk(key, 1, 0, (99,), (key,))
+    ]
+
+
 def test_normal_store_excludes_align_mode_mamba_sources():
     scheduler = _make_partial_tail_scheduler()
     request = _make_partial_tail_request(scheduler)
@@ -5254,15 +5397,6 @@ class TestMambaHybridOffloadServing:
         )
         spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
         return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
-
-    def test_overwrite_stores_are_rejected(self):
-        """Lazy stores do not store the Mamba align state yet."""
-        with pytest.raises(ValueError, match="Mamba align"):
-            self._make_scheduler(
-                None,
-                store_triggers=["ON_COMPUTE", "ON_OVERWRITE"],
-                self_describing_kv_events=False,
-            )
 
     def _roundtrip_served_tokens(self, scheduler) -> int:
         """Request A: prompt-only store, finish; request A2: served tokens."""

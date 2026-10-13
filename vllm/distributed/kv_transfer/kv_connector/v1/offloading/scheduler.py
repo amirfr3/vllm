@@ -677,6 +677,8 @@ class OffloadingConnectorScheduler:
         # block_id -> the block key that the owner expects, for the blocks given
         # out in the current engine step, of all groups
         self._current_batch_allocated_block_keys: dict[int, OffloadKey | None] = {}
+        # The Mamba align blocks with a block hash given out in this step
+        self._current_batch_align_hit_ids: set[int] = set()
         # if GPU prefix caching is enabled,
         # Track loaded chunks to avoid redundant loads.
         self._chunks_being_loaded: set[OffloadKey] | None = (
@@ -711,10 +713,6 @@ class OffloadingConnectorScheduler:
                 raise ValueError(
                     "self_describing_kv_events is not supported with "
                     "ON_OVERWRITE stores"
-                )
-            if self._cow_source_groups:
-                raise ValueError(
-                    "Mamba align groups are not supported with ON_OVERWRITE stores"
                 )
             self._overwrite_map = OverwriteMap()
 
@@ -759,7 +757,8 @@ class OffloadingConnectorScheduler:
         """Record the block key that the owner expects in each allocated block.
 
         A block gets None if its group is not offloaded (the groups share the
-        block pool) or if its hash is not known yet.
+        block pool) or if its hash is not known yet. A Mamba align block gets
+        None unless it is a prefix hit.
         """
         block_keys = self._current_batch_allocated_block_keys
         for block_ids in block_id_groups:
@@ -767,8 +766,13 @@ class OffloadingConnectorScheduler:
         req = req_status.req
         for group_config, start in zip(self.config.kv_group_configs, start_block_idxs):
             num_hashed_blocks = len(req.block_hashes) // group_config.hashes_per_block
+            align = group_config.requires_cow_source
             for idx, bid in enumerate(block_id_groups[group_config.group_idx], start):
-                if bid != 0 and idx < num_hashed_blocks:
+                if (
+                    bid != 0
+                    and idx < num_hashed_blocks
+                    and (not align or bid in self._current_batch_align_hit_ids)
+                ):
                     block_keys[bid] = self._block_key(req, group_config, idx)
 
     def _make_gpu_chunk(
@@ -794,6 +798,35 @@ class OffloadingConnectorScheduler:
             tuple(group_block_ids[idx] for idx in block_idxs),
             tuple(self._block_key(req, group_config, idx) for idx in block_idxs),
         )
+
+    def _make_loaded_chunks(
+        self,
+        req: Request,
+        config_idx: int,
+        chunk_idxs: Iterable[int],
+        offload_keys: Sequence[OffloadKey],
+        group_block_ids: Sequence[int],
+    ) -> list[GpuChunk]:
+        """The group chunks that a load writes to the GPU blocks of a request."""
+        group_config = self.config.kv_group_configs[config_idx]
+        if not group_config.requires_cow_source:
+            return [
+                self._make_gpu_chunk(
+                    req, config_idx, chunk_idx, offload_keys[chunk_idx], group_block_ids
+                )
+                for chunk_idx in chunk_idxs
+            ]
+        # A Mamba align chunk has its state only in its last block.
+        chunks: list[GpuChunk] = []
+        for chunk_idx in chunk_idxs:
+            block_idx = (chunk_idx + 1) * self.config.blocks_per_chunk - 1
+            block_id = group_block_ids[block_idx]
+            if not block_id:
+                continue
+            key = offload_keys[chunk_idx]
+            assert key == self._block_key(req, group_config, block_idx)
+            chunks.append(GpuChunk(key, config_idx, chunk_idx, (block_id,), (key,)))
+        return chunks
 
     def _calc_num_offloadable_tokens(
         self, req_status: RequestOffloadState, num_computed_tokens: int
@@ -1282,6 +1315,13 @@ class OffloadingConnectorScheduler:
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
         req_status = self._req_status[request.request_id]
+        if self._overwrite_map is not None:
+            for group_idx in self._cow_source_groups:
+                self._current_batch_align_hit_ids.update(
+                    block.block_id
+                    for block in blocks.blocks[group_idx]
+                    if not block.is_null and block.block_hash is not None
+                )
         # An async load request is not in the scheduler output of this step.
         self._add_allocated_blocks(
             req_status, blocks.get_block_ids(), [0] * len(req_status.group_states)
@@ -1350,14 +1390,13 @@ class OffloadingConnectorScheduler:
                 if self._overwrite_map is not None:
                     group_block_ids = [block.block_id for block in group_blocks]
                     loaded_chunks.extend(
-                        self._make_gpu_chunk(
+                        self._make_loaded_chunks(
                             request,
                             config_idx,
-                            chunk_idx,
-                            offload_keys[chunk_idx],
+                            range(start_chunk_idx, end_chunk_idx),
+                            offload_keys,
                             group_block_ids,
                         )
-                        for chunk_idx in range(start_chunk_idx, end_chunk_idx)
                     )
                 if partial_tail_boundary is not None:
                     group_keys_to_load.append(
@@ -1511,6 +1550,14 @@ class OffloadingConnectorScheduler:
                     req, group_idx, boundary, req_status.req_context
                 )
                 store_output = self.manager.prepare_store([key], req_status.req_context)
+                if self._overwrite_map is not None:
+                    chunk_idx = boundary // group_config.tokens_per_chunk - 1
+                    self._overwrite_map.add(
+                        [GpuChunk(key, config_idx, chunk_idx, (block_id,), (key,))]
+                    )
+                    # The owner writes this state in this step.
+                    if block_id in self._current_batch_allocated_block_keys:
+                        self._current_batch_allocated_block_keys[block_id] = key
                 if store_output is None:
                     self._connector_stats.increase_counter(
                         _ConnectorMetricName.ALLOCATION_FAILURE
@@ -2136,6 +2183,7 @@ class OffloadingConnectorScheduler:
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_keys = {}
+        self._current_batch_align_hit_ids = set()
         return meta
 
     def has_pending_push_work(self) -> bool:
@@ -2312,6 +2360,7 @@ class OffloadingConnectorScheduler:
         assert not self._current_batch_load_jobs
         assert not self._current_batch_jobs_to_flush
         assert not self._current_batch_allocated_block_keys
+        assert not self._current_batch_align_hit_ids
 
         # Flush all in-flight jobs
         self._current_batch_jobs_to_flush.update(self._jobs.keys())
