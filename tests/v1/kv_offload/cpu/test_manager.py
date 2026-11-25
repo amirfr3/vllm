@@ -2506,3 +2506,74 @@ def test_arc_compute_store_of_a_ghost_key_stays_in_t1():
 
     assert policy.target_t1_size == 1
     assert ghost in policy.t1
+
+
+def test_gpu_residency_is_not_reported_to_a_plain_policy():
+    manager = make_cpu_manager(cache_policy="lru")
+    assert manager._gpu_residency is None
+
+
+def test_gpu_aware_manager_evicts_a_chunk_the_gpu_still_holds_first():
+    """A CPU copy the GPU also holds is redundant, so it goes before the only
+    copy of a chunk the GPU has dropped."""
+    manager = make_cpu_manager(
+        num_chunks=2,
+        cache_policy="gpu_aware_lru",
+        store_triggers=(StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE),
+    )
+    gpu_held = make_req_context("gpu-held")
+    manager.prepare_store([to_key(1)], gpu_held, trigger=StoreTrigger.ON_COMPUTE)
+    manager.complete_store([to_key(1)], gpu_held, trigger=StoreTrigger.ON_COMPUTE)
+    manager.prepare_store([to_key(2)], None, trigger=StoreTrigger.ON_OVERWRITE)
+    manager.complete_store([to_key(2)], None, trigger=StoreTrigger.ON_OVERWRITE)
+
+    output = manager.prepare_store(
+        [to_key(3)], gpu_held, trigger=StoreTrigger.ON_COMPUTE
+    )
+
+    assert output is not None
+    assert output.evicted_keys == [to_key(1)]
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
+    manager.complete_store([to_key(3)], gpu_held, trigger=StoreTrigger.ON_COMPUTE)
+
+
+def test_gpu_aware_manager_load_moves_a_chunk_back_to_the_gpu_band():
+    """A load proves the GPU holds the chunk again, so the next eviction takes
+    the chunk that stayed GPU-backed the longest."""
+    manager = make_cpu_manager(
+        num_chunks=2,
+        cache_policy="gpu_aware_lru",
+        store_triggers=(StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE),
+    )
+    held = make_req_context("held")
+    manager.prepare_store([to_key(1)], held, trigger=StoreTrigger.ON_COMPUTE)
+    manager.complete_store([to_key(1)], held, trigger=StoreTrigger.ON_COMPUTE)
+    manager.prepare_store([to_key(2)], None, trigger=StoreTrigger.ON_OVERWRITE)
+    manager.complete_store([to_key(2)], None, trigger=StoreTrigger.ON_OVERWRITE)
+
+    reuse_keys(manager, [to_key(2)])
+
+    output = manager.prepare_store([to_key(3)], held, trigger=StoreTrigger.ON_COMPUTE)
+    assert output is not None
+    assert output.evicted_keys == [to_key(1)]
+
+
+def test_gpu_aware_manager_keys_the_band_on_the_trigger_not_the_context():
+    """A request-free store is not automatically a GPU drop. Only
+    ON_OVERWRITE means the GPU gives the blocks away."""
+    manager = make_cpu_manager(
+        num_chunks=2,
+        cache_policy="gpu_aware_lru",
+        store_triggers=(StoreTrigger.ON_COMPUTE, StoreTrigger.ON_OVERWRITE),
+    )
+    manager.prepare_store([to_key(1)], None, trigger=StoreTrigger.ON_COMPUTE)
+    manager.complete_store([to_key(1)], None, trigger=StoreTrigger.ON_COMPUTE)
+    manager.prepare_store([to_key(2)], None, trigger=StoreTrigger.ON_OVERWRITE)
+    manager.complete_store([to_key(2)], None, trigger=StoreTrigger.ON_OVERWRITE)
+
+    output = manager.prepare_store(
+        [to_key(3)], make_req_context("held"), trigger=StoreTrigger.ON_COMPUTE
+    )
+
+    assert output is not None
+    assert output.evicted_keys == [to_key(1)]

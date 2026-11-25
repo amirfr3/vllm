@@ -3,6 +3,7 @@
 import ctypes
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
+from typing import Protocol, runtime_checkable
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 
@@ -43,6 +44,19 @@ class ChunkStatus(ctypes.Structure):
     def is_ready(self) -> bool:
         """Returns whether the chunk is ready to be read."""
         return self.ref_cnt >= 0
+
+
+@runtime_checkable
+class GpuResidencyAware(Protocol):
+    """A `CachePolicy` that orders eviction by whether the GPU holds a chunk.
+
+    The manager reports the GPU residency it already observes. A policy without
+    this protocol keeps the plain replacement order and is sent nothing.
+    """
+
+    def set_gpu_resident(self, keys: Iterable[OffloadKey], resident: bool) -> None:
+        """Note that the GPU now holds these chunks, or no longer does."""
+        ...
 
 
 class CachePolicy(ABC):

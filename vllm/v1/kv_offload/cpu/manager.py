@@ -28,7 +28,11 @@ from vllm.v1.kv_offload.cpu.common import (
     CPUOffloadingInfo,
     CPUOffloadingMetrics,
 )
-from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
+from vllm.v1.kv_offload.cpu.policies.base import (
+    CachePolicy,
+    ChunkStatus,
+    GpuResidencyAware,
+)
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
@@ -85,6 +89,10 @@ class CPUOffloadingManager(OffloadingManager):
             cache_policy, cache_policy_module_path
         )
         self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        # Narrowed once here, so no call site checks the policy type.
+        self._gpu_residency: GpuResidencyAware | None = (
+            self._policy if isinstance(self._policy, GpuResidencyAware) else None
+        )
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
@@ -265,6 +273,10 @@ class CPUOffloadingManager(OffloadingManager):
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
+        # Report before the ref_cnt decrement, while the chunks are still
+        # pinned, so a residency-aware policy moves them without touching a heap.
+        if self._gpu_residency is not None:
+            self._gpu_residency.set_gpu_resident(keys, True)
         for key in keys:
             chunk = self._policy.get(key)
             assert chunk is not None, f"Chunk {key!r} not found"
@@ -287,7 +299,14 @@ class CPUOffloadingManager(OffloadingManager):
         *,
         trigger: StoreTrigger,
     ) -> PrepareStoreOutput | None:
-        return self._prepare_store(keys, req_context)
+        output = self._prepare_store(keys, req_context)
+        # ON_OVERWRITE is the GPU giving the chunk's blocks away. Every other
+        # trigger writes chunks the GPU still holds.
+        if self._gpu_residency is not None:
+            self._gpu_residency.set_gpu_resident(
+                keys, resident=trigger is not StoreTrigger.ON_OVERWRITE
+            )
+        return output
 
     def _prepare_store(
         self, keys: Collection[OffloadKey], req_context: ReqContext | None
