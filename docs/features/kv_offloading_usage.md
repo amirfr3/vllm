@@ -119,7 +119,7 @@ Secondary tiers are not supported yet on engines whose workers span several node
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |
-| `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). |
+| `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`/`gpu_aware_lru`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). `gpu_aware_lru` needs `on_overwrite` in `store_when` and is rejected for multi-tier. |
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
@@ -193,7 +193,13 @@ A manager adds a label with `config_info_keys()` of its spec and `config_info()`
 
 ## Custom Eviction Policies
 
-`eviction_policy` resolves through `CachePolicyFactory` (`vllm/v1/kv_offload/cpu/policies/factory.py`), which pre-registers the built-in `lru` and `arc` policies.
+`eviction_policy` resolves through `CachePolicyFactory` (`vllm/v1/kv_offload/cpu/policies/factory.py`), which pre-registers the built-in `lru`, `arc` and `gpu_aware_lru` policies.
+
+### GPU-aware LRU
+
+`gpu_aware_lru` keeps two LRU pools and drains them in order. A chunk the GPU also holds sits in the GPU-backed pool and is evicted first, because the CPU copy is redundant. A chunk without a GPU copy sits in the CPU-only pool and is evicted last, because losing it needs a recompute or a flush. Within a pool the order is plain LRU.
+
+The policy needs the residency signal that only `on_overwrite` stores report, so set `store_when` to include `on_overwrite` (for example `["on_overwrite"]`, the lazy store, or `["on_compute", "on_overwrite"]`). A configuration without it is rejected, and so is multi-tier. Losing the signal means every chunk stays in the GPU-backed pool, which is plain LRU.
 
 ### Out-of-tree (recommended)
 

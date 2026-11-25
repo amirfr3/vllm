@@ -9,6 +9,7 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+from vllm.v1.kv_offload.cpu.policies.gpu_aware_lru import GpuAwareLRUCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
 
@@ -24,7 +25,7 @@ class _DummyCachePolicy(CachePolicy):
         return None
 
     def insert(
-        self, key: OffloadKey, chunk: ChunkStatus, req_context: ReqContext
+        self, key: OffloadKey, chunk: ChunkStatus, req_context: ReqContext | None
     ) -> None:
         pass
 
@@ -70,6 +71,14 @@ class TestCachePolicyFactory:
     def test_lru_and_arc_registered(self):
         assert CachePolicyFactory.get_cache_policy_cls("lru") is LRUCachePolicy
         assert CachePolicyFactory.get_cache_policy_cls("arc") is ARCCachePolicy
+
+    def test_gpu_aware_lru_registered(self):
+        policy_cls = CachePolicyFactory.get_cache_policy_cls("gpu_aware_lru")
+        assert policy_cls is GpuAwareLRUCachePolicy
+
+    def test_gpu_aware_policy_is_residency_aware(self):
+        manager = CPUOffloadingManager(num_chunks=4, cache_policy="gpu_aware_lru")
+        assert manager._gpu_residency is manager._policy
 
     def test_register_and_resolve_custom_policy(self):
         CachePolicyFactory.register_cache_policy(

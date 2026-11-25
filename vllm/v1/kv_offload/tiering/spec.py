@@ -413,6 +413,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 f"['on_handoff'], got {unsupported}"
             )
 
+    def _validate_eviction_policy(self) -> None:
+        """Refuse a policy whose GPU signals the primary tier cannot report.
+
+        `gpu_aware_lru` orders eviction by GPU residency, and the primary tier
+        serves CPU-to-secondary transfers through the same store and load entry
+        points, so a secondary write would look like a GPU arrival.
+        """
+        if self.eviction_policy == "gpu_aware_lru":
+            raise ValueError(
+                "eviction_policy 'gpu_aware_lru' is not supported with tiering"
+            )
+
     @override
     def get_manager(self) -> OffloadingManager:
         """Get the TieringOffloadingManager.

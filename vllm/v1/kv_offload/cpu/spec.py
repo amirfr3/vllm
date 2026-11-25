@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Mapping
 from typing import Any
 
 from typing_extensions import override
@@ -48,7 +49,9 @@ def _all_workers_barrier() -> None:
     group.barrier()
 
 
-def parse_store_triggers(extra_config: dict[str, Any]) -> tuple[StoreTrigger, ...]:
+def parse_store_triggers(
+    extra_config: Mapping[str, Any],
+) -> tuple[StoreTrigger, ...]:
     """Resolve the store_when key into the triggers that offload a chunk.
 
     Resolves the names only. An empty or repeated set, or a trigger that the KV
@@ -198,6 +201,19 @@ class CPUOffloadingSpec(OffloadingSpec):
             "cache_policy_module_path"
         )
         self.store_triggers = parse_store_triggers(self.extra_config)
+        self._validate_eviction_policy()
+
+    def _validate_eviction_policy(self) -> None:
+        """Refuse an eviction policy whose signals this spec cannot provide."""
+        if (
+            self.eviction_policy == "gpu_aware_lru"
+            and StoreTrigger.ON_OVERWRITE not in self.store_triggers
+        ):
+            raise ValueError(
+                "eviction_policy 'gpu_aware_lru' needs the GPU residency signal "
+                'that only ON_OVERWRITE stores report. Add "on_overwrite" to '
+                "store_when."
+            )
 
     @classmethod
     @override

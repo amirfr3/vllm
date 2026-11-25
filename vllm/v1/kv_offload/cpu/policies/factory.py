@@ -89,3 +89,8 @@ CachePolicyFactory.register_cache_policy(
 CachePolicyFactory.register_cache_policy(
     "arc", "vllm.v1.kv_offload.cpu.policies.arc", "ARCCachePolicy"
 )
+CachePolicyFactory.register_cache_policy(
+    "gpu_aware_lru",
+    "vllm.v1.kv_offload.cpu.policies.gpu_aware_lru",
+    "GpuAwareLRUCachePolicy",
+)

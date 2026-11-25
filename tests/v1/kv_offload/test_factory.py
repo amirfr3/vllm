@@ -5,7 +5,7 @@
 import logging
 import os
 import uuid
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.config import (
     OffloadingGroupConfig,
 )
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingInfo
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -980,3 +981,41 @@ def test_tiering_spec_rejects_secondary_tiers_across_nodes(
     # them every group is queried, even after one spans nodes, since each
     # query is a collective that the group's other ranks also join.
     assert sorted(queried) == (["pcp", "pp", "tp"] if secondary_tiers else [])
+
+
+def test_cpu_spec_allows_gpu_aware_lru_with_on_overwrite():
+    spec = _create_spec(
+        extra_config={
+            "store_when": ["on_overwrite"],
+            "eviction_policy": "gpu_aware_lru",
+        }
+    )
+    manager = cast(CPUOffloadingManager, spec.get_manager())
+    assert manager._gpu_residency is manager._policy
+
+
+def test_cpu_spec_allows_gpu_aware_lru_in_a_multi_trigger_set():
+    spec = _create_spec(
+        extra_config={
+            "store_when": ["on_compute", "on_overwrite"],
+            "eviction_policy": "gpu_aware_lru",
+        }
+    )
+    manager = cast(CPUOffloadingManager, spec.get_manager())
+    assert manager._gpu_residency is manager._policy
+
+
+@pytest.mark.parametrize("store_when", [[], ["on_compute"], ["on_handoff"]])
+def test_cpu_spec_rejects_gpu_aware_lru_without_on_overwrite(store_when):
+    with pytest.raises(ValueError, match="needs the GPU residency"):
+        _create_spec(
+            extra_config={"store_when": store_when, "eviction_policy": "gpu_aware_lru"}
+        )
+
+
+def test_tiering_spec_rejects_gpu_aware_lru():
+    with pytest.raises(ValueError, match="not supported with tiering"):
+        _create_spec(
+            spec_name="TieringOffloadingSpec",
+            extra_config={"eviction_policy": "gpu_aware_lru"},
+        )
