@@ -218,6 +218,12 @@ class LRUCachePolicy(CachePolicy):
         self._maybe_compact_heap()
         return candidates
 
+    def num_evictable(self, protected: set[OffloadKey]) -> int:
+        """Count evictable chunks that an eviction may take."""
+        if not protected:
+            return len(self._evictable)
+        return len(self._evictable - protected)
+
     @override
     def mark_evictable(self, key: OffloadKey) -> None:
         # chunks can become evictable when,
